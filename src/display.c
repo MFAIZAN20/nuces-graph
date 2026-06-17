@@ -138,6 +138,45 @@ void exportDot(struct nGraph *B) {
   fprintf(stdout, "}\n");
 }
 
+void exportDotWithAnalysis(struct nGraph *B, int start_label, int exit_label) {
+  char *table = analysisTableDotHtml(B, start_label, exit_label);
+
+  fprintf(stdout, "digraph %s {\n", B->label);
+  fprintf(stdout, "\tgraph [labelloc=\"b\", labeljust=\"l\"];\n");
+  if (table != NULL) {
+    fprintf(stdout, "\tlabel=<%s>;\n", table);
+  }
+  fprintf(stdout, "\tnode [shape=\"circle\"];\n");
+
+  {
+    struct vertex *tmpV = B->V->head;
+    while (tmpV != NULL) {
+      fprintf(stdout, "\t%d", tmpV->label);
+      if (tmpV->lblString != NULL) {
+        fprintf(stdout, " [label=\"%s\"]", tmpV->lblString);
+      }
+      fprintf(stdout, ";\n");
+      tmpV = tmpV->next;
+    }
+  }
+
+  {
+    struct edge *tmp = B->E->head;
+    while (tmp != NULL) {
+      if (tmp->weight == 0) {
+        fprintf(stdout, "\t%d -> %d;\n", tmp->head, tmp->tail);
+      } else {
+        fprintf(stdout, "\t%d -> %d[label=\"%d\"];\n", tmp->head, tmp->tail,
+                tmp->weight);
+      }
+      tmp = tmp->next;
+    }
+  }
+
+  fprintf(stdout, "}\n");
+  free(table);
+}
+
 /**
  * Renders a graph $B$ using Graphviz and automatically opens it in a PDF
  * viewer. If displayType of $B$ is set to 0 (which is default), an intelligent
@@ -306,6 +345,131 @@ void showDot(struct nGraph *B) {
   free(fileimage);
 }
 
+void showDotWithAnalysis(struct nGraph *B, int start_label, int exit_label) {
+  char template_buf[] = "/tmp/nucesGraphXXXXXX";
+  char *filename = (char *)malloc((size_t)PATH_MAX);
+  char *fileimage = (char *)malloc((size_t)PATH_MAX);
+  char *table = analysisTableDotHtml(B, start_label, exit_label);
+  pid_t pid;
+
+  if (filename == NULL || fileimage == NULL) {
+    free(filename);
+    free(fileimage);
+    free(table);
+    return;
+  }
+  strcpy(filename, template_buf);
+  if (mkstemp(filename) == -1) {
+    fprintf(stderr, "showDotWithAnalysis(): Temp File Creation Error\n");
+    free(filename);
+    free(fileimage);
+    free(table);
+    return;
+  }
+  strcpy(fileimage, filename);
+  strcat(fileimage, ".pdf");
+
+  {
+    FILE *tf = fopen(filename, "w+");
+    if (tf) {
+      fprintf(tf, "digraph %s {\n", B->label);
+      fprintf(tf, "\tgraph [labelloc=\"b\", labeljust=\"l\"];\n");
+      if (table != NULL) {
+        fprintf(tf, "\tlabel=<%s>;\n", table);
+      }
+      fprintf(tf, "\toverlap = false;\n");
+      fprintf(tf, "\tsplines = \"curved\";\n");
+      fprintf(tf, "\tsep = 3;\n");
+      fprintf(tf, "\tnode [shape=\"circle\"];\n");
+
+      {
+        struct vertex *tmpV = B->V->head;
+        while (tmpV != NULL) {
+          fprintf(tf, "\t%d", tmpV->label);
+          if (tmpV->lblString != NULL || tmpV->color != -1) {
+            fprintf(tf, " [");
+            if (tmpV->lblString != NULL) {
+              fprintf(tf, "label=\"%s\"", tmpV->lblString);
+            }
+            if (tmpV->lblString != NULL && tmpV->color != -1) {
+              fprintf(tf, ", ");
+            }
+            if (tmpV->color != -1) {
+              fprintf(tf, "style=filled, color=\"%s\"", colors[tmpV->color]);
+            }
+            fprintf(tf, "]");
+          }
+          fprintf(tf, ";\n");
+          tmpV = tmpV->next;
+        }
+      }
+
+      {
+        struct edge *tmp = B->E->head;
+        while (tmp != NULL) {
+          if (tmp->directed == 0) {
+            if (tmp->weight == 0) {
+              fprintf(tf, "\t%d -> %d[dir=none];\n", tmp->head, tmp->tail);
+            } else {
+              fprintf(tf, "\t%d -> %d[dir=none,label=\"%d\"];\n", tmp->head,
+                      tmp->tail, tmp->weight);
+            }
+          } else {
+            if (tmp->weight == 0) {
+              fprintf(tf, "\t%d -> %d;\n", tmp->head, tmp->tail);
+            } else {
+              fprintf(tf, "\t%d -> %d[label=\"%d\"];\n", tmp->head, tmp->tail,
+                      tmp->weight);
+            }
+          }
+          tmp = tmp->next;
+        }
+      }
+
+      fprintf(tf, "}\n");
+      fclose(tf);
+    }
+  }
+  free(table);
+
+  pid = fork();
+  if (pid == 0) {
+    printf("Source (dot) at: %s\nImage  (pdf) at: %s\n\n", filename, fileimage);
+    switch (B->displayType) {
+    case 2:
+      execl("/usr/bin/twopi", "/usr/bin/twopi", filename, "-T", "pdf", "-o",
+            fileimage, NULL);
+      break;
+    case 1:
+      execl("/usr/bin/sfdp", "/usr/bin/sfdp", filename, "-T", "pdf", "-o",
+            fileimage, NULL);
+      break;
+    case 3:
+      execl("/usr/bin/dot", "/usr/bin/dot", filename, "-T", "pdf", "-o",
+            fileimage, NULL);
+      break;
+    default:
+      execl("/usr/bin/neato", "/usr/bin/neato", filename, "-T", "pdf", "-o",
+            fileimage, NULL);
+      break;
+    }
+    _exit(1);
+  } else if (pid > 0) {
+    wait(NULL);
+  }
+
+  if (getenv("DISPLAY")) {
+    pid = fork();
+    if (pid == 0) {
+      execl("/usr/bin/okular", "/usr/bin/okular", fileimage, NULL);
+      _exit(1);
+    }
+  }
+
+  free(filename);
+  free(fileimage);
+}
+
 void show(struct nGraph *B) {
   listVertices(B);
   listEdges(B);
@@ -400,6 +564,101 @@ void setDisplayType(struct nGraph *G, char *type) {
   } else {
     G->displayType = 0;
   }
+}
+
+void exportAnalysisDot(struct nGraph *G, int start_label, int exit_label) {
+  char *table = analysisTableDotHtml(G, start_label, exit_label);
+
+  fprintf(stdout, "digraph \"Analysis_%s\" {\n", G->label);
+  fprintf(stdout, "\tbgcolor=\"white\";\n");
+  fprintf(stdout, "\tgraph [pad=\"0.5\"];\n");
+  fprintf(stdout, "\tnode [shape=none, margin=0];\n");
+  if (table != NULL) {
+    fprintf(stdout, "\tanalysis [label=<%s>];\n", table);
+  } else {
+    fprintf(stdout, "\tanalysis [label=\"Analysis unavailable\"];\n");
+  }
+  fprintf(stdout, "}\n");
+  free(table);
+}
+
+void showAnalysisPdf(struct nGraph *G, int start_label, int exit_label) {
+  char template_buf[] = "/tmp/nucesGraphXXXXXX";
+  char *filename = (char *)malloc((size_t)PATH_MAX);
+  char *fileimage = (char *)malloc((size_t)PATH_MAX);
+  char *table = analysisTableDotHtml(G, start_label, exit_label);
+  FILE *tf;
+  pid_t pid;
+
+  if (filename == NULL || fileimage == NULL) {
+    free(filename);
+    free(fileimage);
+    free(table);
+    return;
+  }
+  strcpy(filename, template_buf);
+  if (mkstemp(filename) == -1) {
+    fprintf(stderr, "showAnalysisPdf(): Temp File Creation Error\n");
+    free(filename);
+    free(fileimage);
+    free(table);
+    return;
+  }
+  strcpy(fileimage, filename);
+  strcat(fileimage, ".pdf");
+
+  tf = fopen(filename, "w+");
+  if (tf) {
+    fprintf(tf, "digraph \"Analysis_%s\" {\n", G->label);
+    fprintf(tf, "\tbgcolor=\"white\";\n");
+    fprintf(tf, "\tgraph [pad=\"0.5\", nodesep=\"0.5\", ranksep=\"0.5\"];\n");
+    fprintf(tf, "\tnode [shape=none, margin=0];\n");
+    if (table != NULL) {
+      fprintf(tf, "\tanalysis [label=<%s>];\n", table);
+    } else {
+      fprintf(tf, "\tanalysis [label=\"Analysis unavailable\"];\n");
+    }
+    fprintf(tf, "}\n");
+    fclose(tf);
+  }
+  free(table);
+
+  pid = fork();
+  if (pid == 0) {
+    printf("Source (dot) at: %s\nImage  (pdf) at: %s\n\n", filename, fileimage);
+    switch (G->displayType) {
+    case 2:
+      execl("/usr/bin/twopi", "/usr/bin/twopi", filename, "-T", "pdf", "-o",
+            fileimage, NULL);
+      break;
+    case 1:
+      execl("/usr/bin/sfdp", "/usr/bin/sfdp", filename, "-T", "pdf", "-o",
+            fileimage, NULL);
+      break;
+    case 3:
+      execl("/usr/bin/dot", "/usr/bin/dot", filename, "-T", "pdf", "-o",
+            fileimage, NULL);
+      break;
+    default:
+      execl("/usr/bin/dot", "/usr/bin/dot", filename, "-T", "pdf", "-o",
+            fileimage, NULL);
+      break;
+    }
+    _exit(1);
+  } else if (pid > 0) {
+    wait(NULL);
+  }
+
+  if (getenv("DISPLAY")) {
+    pid = fork();
+    if (pid == 0) {
+      execl("/usr/bin/okular", "/usr/bin/okular", fileimage, NULL);
+      _exit(1);
+    }
+  }
+
+  free(filename);
+  free(fileimage);
 }
 
 /**

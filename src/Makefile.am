@@ -3,6 +3,7 @@ AM_CPPFLAGS = -I$(top_srcdir)/include
 
 lib_LTLIBRARIES = libNucesGraph.la
 libNucesGraph_la_SOURCES = \
+    analysis.c \
     clique.c \
     display.c \
     generate.c \

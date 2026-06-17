@@ -3,6 +3,7 @@ LDADD = $(top_builddir)/src/libNucesGraph.la $(LLVM_LIBS)
 
 # Programs that are part of the test suite
 TEST_PROGS = \
+    analysis \
     binaryops \
     clique \
     eccentricity \
@@ -16,6 +17,7 @@ TEST_PROGS = \
 # No-install programs (built only for testing)
 check_PROGRAMS = $(TEST_PROGS) dotimport callgraph
 
+analysis_SOURCES = analysis.c
 callgraph_SOURCES = callgraphs.c
 dotimport_SOURCES = dotimport.c
 binaryops_SOURCES = binaryops.c

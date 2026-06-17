@@ -25,13 +25,23 @@ PKG_PROG_PKG_CONFIG
 
 # Checks for LLVM / libclang
 AC_PATH_PROG([LLVM_CONFIG], [llvm-config], [no])
+LLVM_FOUND=no
 AS_IF([test "x$LLVM_CONFIG" != "xno"], [
     LLVM_CFLAGS="$($LLVM_CONFIG --cflags | tr '\n' ' ')"
     LLVM_LIBS="$($LLVM_CONFIG --ldflags --system-libs --libs | tr '\n' ' ') -lclang"
     AC_SUBST([LLVM_CFLAGS])
     AC_SUBST([LLVM_LIBS])
+    LLVM_FOUND=yes
+], [
+    AC_CHECK_LIB([clang], [clang_createIndex], [
+        LLVM_CFLAGS=""
+        LLVM_LIBS="-lclang"
+        AC_SUBST([LLVM_CFLAGS])
+        AC_SUBST([LLVM_LIBS])
+        LLVM_FOUND=yes
+    ])
 ])
-AM_CONDITIONAL([HAVE_LLVM], [test "x$LLVM_CONFIG" != "xno"])
+AM_CONDITIONAL([HAVE_LLVM], [test "x$LLVM_FOUND" = "xyes"])
 
 AC_CONFIG_FILES([
     Makefile

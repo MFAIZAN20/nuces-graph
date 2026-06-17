@@ -128,10 +128,14 @@ void qr_decomposition(struct nGraph *, double *, double *);
 void show(struct nGraph *);
 void showDot(struct nGraph *);
 void exportDot(struct nGraph *);
+void showDotWithAnalysis(struct nGraph *, int, int);
+void exportDotWithAnalysis(struct nGraph *, int, int);
 void showDimac(struct nGraph *);
 void exportDimac(struct nGraph *);
 void makeDimac(struct nGraph *, char *);
 void exportGLPK(struct nGraph *);
+void showAnalysisPdf(struct nGraph *, int, int);
+void exportAnalysisDot(struct nGraph *, int, int);
 void exportTikZ(struct nGraph *);
 void exportGraphML(struct nGraph *);
 void listVerticesAlphabet(struct nGraph *);
@@ -201,6 +205,25 @@ void analyzeAllCoupling(struct nGraph *);
 void analyzeSpaghettiCode(struct nGraph *);
 void analyzeTightCoupling(struct nGraph *);
 void analyzeDeadCode(struct nGraph *);
+
+// CFG / static analysis helpers
+int getVertexLabels(struct nGraph *, int *, int);
+int graphNodeCount(struct nGraph *);
+int graphEdgeCount(struct nGraph *);
+int cyclomaticComplexity(struct nGraph *);
+int cfgDfsOrder(struct nGraph *, int, int *, int);
+int cfgBfsOrder(struct nGraph *, int, int *, int);
+int dominatorWordCount(int);
+int computeDominators(struct nGraph *, int, unsigned long *, int);
+int computePostDominators(struct nGraph *, int, unsigned long *, int);
+int computeImmediateDominators(struct nGraph *, int, int *);
+int computeImmediatePostDominators(struct nGraph *, int, int *);
+int computeSCCs(struct nGraph *, int *);
+int computeLoopNestingDepth(struct nGraph *, int, int *);
+int sliceForward(struct nGraph *, int, int *, int);
+int sliceBackward(struct nGraph *, int, int *, int);
+int printAnalysisTable(struct nGraph *, int, int);
+char *analysisTableDotHtml(struct nGraph *, int, int);
 
 // Extra
 struct CallGraphBuilder {
