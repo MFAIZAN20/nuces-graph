@@ -207,21 +207,21 @@ void analyzeTightCoupling(struct nGraph *);
 void analyzeDeadCode(struct nGraph *);
 
 // CFG / static analysis helpers
-int getVertexLabels(struct nGraph *, int *, int);
-int graphNodeCount(struct nGraph *);
-int graphEdgeCount(struct nGraph *);
-int cyclomaticComplexity(struct nGraph *);
-int cfgDfsOrder(struct nGraph *, int, int *, int);
-int cfgBfsOrder(struct nGraph *, int, int *, int);
+int getVertexLabels(const struct nGraph *, int *, int);
+int graphNodeCount(const struct nGraph *);
+int graphEdgeCount(const struct nGraph *);
+int cyclomaticComplexity(const struct nGraph *);
+int cfgDfsOrder(const struct nGraph *, int, int *, int);
+int cfgBfsOrder(const struct nGraph *, int, int *, int);
 int dominatorWordCount(int);
-int computeDominators(struct nGraph *, int, unsigned long *, int);
-int computePostDominators(struct nGraph *, int, unsigned long *, int);
-int computeImmediateDominators(struct nGraph *, int, int *);
-int computeImmediatePostDominators(struct nGraph *, int, int *);
-int computeSCCs(struct nGraph *, int *);
-int computeLoopNestingDepth(struct nGraph *, int, int *);
-int sliceForward(struct nGraph *, int, int *, int);
-int sliceBackward(struct nGraph *, int, int *, int);
+int computeDominators(const struct nGraph *, int, unsigned long *, int);
+int computePostDominators(const struct nGraph *, int, unsigned long *, int);
+int computeImmediateDominators(const struct nGraph *, int, int *, int);
+int computeImmediatePostDominators(const struct nGraph *, int, int *, int);
+int computeSCCs(const struct nGraph *, int *, int);
+int computeLoopNestingDepth(const struct nGraph *, int, int *, int);
+int sliceForward(const struct nGraph *, int, int *, int);
+int sliceBackward(const struct nGraph *, int, int *, int);
 int printAnalysisTable(struct nGraph *, int, int);
 char *analysisTableDotHtml(struct nGraph *, int, int);
 

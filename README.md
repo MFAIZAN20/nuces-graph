@@ -119,11 +119,11 @@ int computeDominators(struct nGraph *G, int start_label,
                       unsigned long *dom, int word_count);
 int computePostDominators(struct nGraph *G, int exit_label,
                           unsigned long *pdom, int word_count);
-int computeImmediateDominators(struct nGraph *G, int start_label, int *idom);
-int computeImmediatePostDominators(struct nGraph *G, int exit_label, int *ipdom);
+int computeImmediateDominators(const struct nGraph *G, int start_label, int *idom, int idom_len);
+int computeImmediatePostDominators(const struct nGraph *G, int exit_label, int *ipdom, int ipdom_len);
 
-int computeSCCs(struct nGraph *G, int *scc_id);
-int computeLoopNestingDepth(struct nGraph *G, int start_label, int *depth_out);
+int computeSCCs(const struct nGraph *G, int *scc_id, int scc_id_len);
+int computeLoopNestingDepth(const struct nGraph *G, int start_label, int *depth_out, int depth_len);
 
 int sliceForward(struct nGraph *dep, int start_label, int *mark, int mark_len);
 int sliceBackward(struct nGraph *dep, int start_label, int *mark, int mark_len);

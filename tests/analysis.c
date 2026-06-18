@@ -4,8 +4,7 @@
 
 static int index_of(const int *labels, int n, int label)
 {
-	int i;
-	for (i = 0; i < n; i++) {
+	for (int i = 0; i < n; i++) {
 		if (labels[i] == label) return i;
 	}
 	return -1;
@@ -64,13 +63,18 @@ int main(void)
 	int *ipdom = (int *)calloc(4, sizeof(int));
 	if (!dom || !pdom || !idom || !ipdom) {
 		fprintf(stderr, "analysis test failed: alloc\n");
+		free(dom);
+		free(pdom);
+		free(idom);
+		free(ipdom);
+		nGraphFree(&G);
 		return 1;
 	}
 
 	ok &= check(computeDominators(&G, 10, dom, words) == 0, "compute dominators");
 	ok &= check(computePostDominators(&G, 30, pdom, words) == 0, "compute post dominators");
-	ok &= check(computeImmediateDominators(&G, 10, idom) == 0, "compute idom");
-	ok &= check(computeImmediatePostDominators(&G, 30, ipdom) == 0, "compute ipdom");
+	ok &= check(computeImmediateDominators(&G, 10, idom, 4) == 0, "compute idom");
+	ok &= check(computeImmediatePostDominators(&G, 30, ipdom, 4) == 0, "compute ipdom");
 
 	int a = index_of(labels, 4, 10);
 	int b = index_of(labels, 4, 20);
@@ -99,7 +103,7 @@ int main(void)
 	ok &= check(ipdom[d] == 30, "ipdom D");
 
 	int depth[4];
-	int max_depth = computeLoopNestingDepth(&G, 10, depth);
+	int max_depth = computeLoopNestingDepth(&G, 10, depth, 4);
 	ok &= check(max_depth == 0, "loop depth max");
 	ok &= check(depth[0] == 0 && depth[1] == 0 && depth[2] == 0 && depth[3] == 0, "loop depth per node");
 
@@ -125,10 +129,33 @@ int main(void)
 	addEdgeDirected(&H, 3, 1, 1);
 
 	int scc_id[3];
-	int scc_count = computeSCCs(&H, scc_id);
+	int scc_count = computeSCCs(&H, scc_id, 3);
 	ok &= check(scc_count == 1, "scc count");
 	ok &= check(scc_id[0] == scc_id[1] && scc_id[1] == scc_id[2], "scc ids");
 	nGraphFree(&H);
+
+	struct nGraph U = newGraph("Unreachable");
+	addVertex(&U, 1);
+	addVertex(&U, 2);
+	addVertex(&U, 3);
+	addEdgeDirected(&U, 1, 2, 1);
+
+	int unreachable_idom[3];
+	int unreachable_depth[3];
+	ok &= check(computeImmediateDominators(&U, 1, unreachable_idom, 3) == 0,
+		"unreachable idom computation");
+	ok &= check(unreachable_idom[0] == 1 && unreachable_idom[1] == 1 &&
+		unreachable_idom[2] == -1, "unreachable idom values");
+	ok &= check(computeLoopNestingDepth(&U, 1, unreachable_depth, 3) == 0,
+		"unreachable loop depth");
+	nGraphFree(&U);
+
+	struct nGraph Z = newGraph("NoEdges");
+	addVertex(&Z, 7);
+	char *empty_analysis = analysisTableDotHtml(&Z, 7, 7);
+	ok &= check(empty_analysis != NULL, "empty-edge analysis");
+	free(empty_analysis);
+	nGraphFree(&Z);
 
 	if (!ok) return 1;
 	printf("analysis tests passed\n");

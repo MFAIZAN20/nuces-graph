@@ -2,7 +2,6 @@
 #include <string.h>
 #include <limits.h>
 #include <stdio.h>
-#include <stdarg.h>
 #include "nucesGraph.h"
 
 struct label_index {
@@ -20,6 +19,15 @@ struct graph_adj {
 	int *labels;
 	struct label_index *map;
 };
+
+static int compute_cfg_order_internal(const struct nGraph *G, int start_label,
+	int *order, int max_order, int breadth_first);
+static int compute_dominator_sets_internal(const struct nGraph *G, int root_label,
+	unsigned long *dom, int word_count, int use_preds);
+static int compute_immediate_dominators_internal(const struct nGraph *G, int root_label,
+	int *idom, int idom_len, int use_preds);
+static int compute_slice_internal(const struct nGraph *dep, int start_label, int *mark,
+	int mark_len, int use_predecessors);
 
 static int cmp_label_index(const void *a, const void *b)
 {
@@ -104,6 +112,62 @@ static void free_graph_adj(struct graph_adj *adj)
 	memset(adj, 0, sizeof(*adj));
 }
 
+static int edge_vertex_indices(const struct graph_adj *adj,
+	const struct edge *edge, int *head, int *tail)
+{
+	*head = map_label_to_index(adj->map, adj->n, edge->head);
+	*tail = map_label_to_index(adj->map, adj->n, edge->tail);
+	return (*head >= 0 && *tail >= 0) ? 0 : -1;
+}
+
+static int count_adjacency_degrees(const struct nGraph *G, int undirected_mode,
+	const struct graph_adj *adj, int *out_degree, int *in_degree)
+{
+	for (const struct edge *edge = G->E->head; edge != NULL; edge = edge->next) {
+		int head;
+		int tail;
+		if (edge_vertex_indices(adj, edge, &head, &tail) != 0) {
+			return -1;
+		}
+		out_degree[head]++;
+		in_degree[tail]++;
+		if (undirected_mode || edge->directed == 0) {
+			out_degree[tail]++;
+			in_degree[head]++;
+		}
+	}
+	return 0;
+}
+
+static void build_adjacency_offsets(struct graph_adj *adj,
+	const int *out_degree, const int *in_degree)
+{
+	for (int i = 0; i < adj->n; i++) {
+		adj->out_start[i + 1] = adj->out_start[i] + out_degree[i];
+		adj->in_start[i + 1] = adj->in_start[i] + in_degree[i];
+	}
+	adj->m = adj->out_start[adj->n];
+}
+
+static int fill_adjacency_edges(const struct nGraph *G, int undirected_mode,
+	struct graph_adj *adj, int *out_cursor, int *in_cursor)
+{
+	for (const struct edge *edge = G->E->head; edge != NULL; edge = edge->next) {
+		int head;
+		int tail;
+		if (edge_vertex_indices(adj, edge, &head, &tail) != 0) {
+			return -1;
+		}
+		adj->out[out_cursor[head]++] = tail;
+		adj->in[in_cursor[tail]++] = head;
+		if (undirected_mode || edge->directed == 0) {
+			adj->out[out_cursor[tail]++] = head;
+			adj->in[in_cursor[head]++] = tail;
+		}
+	}
+	return 0;
+}
+
 static int build_adjacency(const struct nGraph *G, int undirected_mode, struct graph_adj *adj)
 {
 	int n = 0;
@@ -111,8 +175,6 @@ static int build_adjacency(const struct nGraph *G, int undirected_mode, struct g
 	int *in_deg = NULL;
 	int *out_cursor = NULL;
 	int *in_cursor = NULL;
-	struct edge *e = NULL;
-	int i = 0;
 
 	memset(adj, 0, sizeof(*adj));
 
@@ -131,26 +193,12 @@ static int build_adjacency(const struct nGraph *G, int undirected_mode, struct g
 		return -1;
 	}
 
-	e = G->E->head;
-	while (e != NULL) {
-		int u = map_label_to_index(adj->map, n, e->head);
-		int v = map_label_to_index(adj->map, n, e->tail);
-		if (u < 0 || v < 0) {
-			free(out_deg);
-			free(in_deg);
-			free_graph_adj(adj);
-			return -1;
-		}
-		if (undirected_mode || e->directed == 0) {
-			out_deg[u]++;
-			out_deg[v]++;
-			in_deg[u]++;
-			in_deg[v]++;
-		} else {
-			out_deg[u]++;
-			in_deg[v]++;
-		}
-		e = e->next;
+	if (count_adjacency_degrees(G, undirected_mode, adj,
+	    out_deg, in_deg) != 0) {
+		free(out_deg);
+		free(in_deg);
+		free_graph_adj(adj);
+		return -1;
 	}
 
 	adj->out_start = (int *)calloc((size_t)(n + 1), sizeof(int));
@@ -162,11 +210,7 @@ static int build_adjacency(const struct nGraph *G, int undirected_mode, struct g
 		return -1;
 	}
 
-	for (i = 0; i < n; i++) {
-		adj->out_start[i + 1] = adj->out_start[i] + out_deg[i];
-		adj->in_start[i + 1] = adj->in_start[i] + in_deg[i];
-	}
-	adj->m = adj->out_start[n];
+	build_adjacency_offsets(adj, out_deg, in_deg);
 	if (adj->m > 0) {
 		adj->out = (int *)calloc((size_t)adj->m, sizeof(int));
 	}
@@ -174,6 +218,12 @@ static int build_adjacency(const struct nGraph *G, int undirected_mode, struct g
 		adj->in = (int *)calloc((size_t)adj->in_start[n], sizeof(int));
 	}
 	if ((adj->m > 0 && adj->out == NULL) || (adj->in_start[n] > 0 && adj->in == NULL)) {
+		free(out_deg);
+		free(in_deg);
+		free_graph_adj(adj);
+		return -1;
+	}
+	if (G->E->head != NULL && (adj->out == NULL || adj->in == NULL)) {
 		free(out_deg);
 		free(in_deg);
 		free_graph_adj(adj);
@@ -190,25 +240,19 @@ static int build_adjacency(const struct nGraph *G, int undirected_mode, struct g
 		free_graph_adj(adj);
 		return -1;
 	}
-	for (i = 0; i < n; i++) {
+	for (int i = 0; i < n; i++) {
 		out_cursor[i] = adj->out_start[i];
 		in_cursor[i] = adj->in_start[i];
 	}
 
-	e = G->E->head;
-	while (e != NULL) {
-		int u = map_label_to_index(adj->map, n, e->head);
-		int v = map_label_to_index(adj->map, n, e->tail);
-		if (undirected_mode || e->directed == 0) {
-			adj->out[out_cursor[u]++] = v;
-			adj->out[out_cursor[v]++] = u;
-			adj->in[in_cursor[u]++] = v;
-			adj->in[in_cursor[v]++] = u;
-		} else {
-			adj->out[out_cursor[u]++] = v;
-			adj->in[in_cursor[v]++] = u;
-		}
-		e = e->next;
+	if (fill_adjacency_edges(G, undirected_mode, adj,
+	    out_cursor, in_cursor) != 0) {
+		free(out_deg);
+		free(in_deg);
+		free(out_cursor);
+		free(in_cursor);
+		free_graph_adj(adj);
+		return -1;
 	}
 
 	free(out_deg);
@@ -218,7 +262,7 @@ static int build_adjacency(const struct nGraph *G, int undirected_mode, struct g
 	return 0;
 }
 
-int getVertexLabels(struct nGraph *G, int *labels, int max_labels)
+int getVertexLabels(const struct nGraph *G, int *labels, int max_labels)
 {
 	int i = 0;
 	if (G == NULL || G->V == NULL) {
@@ -235,16 +279,50 @@ int getVertexLabels(struct nGraph *G, int *labels, int max_labels)
 	return i;
 }
 
-int graphNodeCount(struct nGraph *G)
+int graphNodeCount(const struct nGraph *G)
 {
 	if (G == NULL || G->V == NULL) return -1;
 	return G->V->count;
 }
 
-int graphEdgeCount(struct nGraph *G)
+int graphEdgeCount(const struct nGraph *G)
 {
 	if (G == NULL || G->E == NULL) return -1;
 	return G->E->count;
+}
+
+static int visit_weak_component(const struct graph_adj *adj, int root,
+	int *visited, int *queue)
+{
+	int head = 0;
+	int tail = 0;
+
+	if (root < 0 || root >= adj->n) {
+		return -1;
+	}
+	visited[root] = 1;
+	queue[tail++] = root;
+	while (head < tail) {
+		if (head >= adj->n) {
+			return -1;
+		}
+		int vertex = queue[head++];
+		for (int i = adj->out_start[vertex];
+		     i < adj->out_start[vertex + 1]; i++) {
+			int successor = adj->out[i];
+			if (successor < 0 || successor >= adj->n) {
+				return -1;
+			}
+			if (!visited[successor]) {
+				if (tail >= adj->n) {
+					return -1;
+				}
+				visited[successor] = 1;
+				queue[tail++] = successor;
+			}
+		}
+	}
+	return 0;
 }
 
 static int count_weak_components(const struct graph_adj *adj)
@@ -253,7 +331,6 @@ static int count_weak_components(const struct graph_adj *adj)
 	int *visited = (int *)calloc((size_t)n, sizeof(int));
 	int *queue = (int *)calloc((size_t)n, sizeof(int));
 	int components = 0;
-	int i;
 
 	if (visited == NULL || queue == NULL) {
 		free(visited);
@@ -261,25 +338,12 @@ static int count_weak_components(const struct graph_adj *adj)
 		return -1;
 	}
 
-	for (i = 0; i < n; i++) {
+	for (int i = 0; i < n; i++) {
 		if (visited[i]) continue;
 		components++;
-		int qh = 0;
-		int qt = 0;
-		visited[i] = 1;
-		queue[qt++] = i;
-		while (qh < qt) {
-			int v = queue[qh++];
-			int start = adj->out_start[v];
-			int end = adj->out_start[v + 1];
-			int j;
-			for (j = start; j < end; j++) {
-				int w = adj->out[j];
-				if (!visited[w]) {
-					visited[w] = 1;
-					queue[qt++] = w;
-				}
-			}
+		if (visit_weak_component(adj, i, visited, queue) != 0) {
+			components = -1;
+			break;
 		}
 	}
 
@@ -288,7 +352,7 @@ static int count_weak_components(const struct graph_adj *adj)
 	return components;
 }
 
-int cyclomaticComplexity(struct nGraph *G)
+int cyclomaticComplexity(const struct nGraph *G)
 {
 	struct graph_adj adj;
 	int components = 0;
@@ -315,73 +379,51 @@ int cyclomaticComplexity(struct nGraph *G)
 	return complexity;
 }
 
-int cfgDfsOrder(struct nGraph *G, int start_label, int *order, int max_order)
+int cfgDfsOrder(const struct nGraph *G, int start_label, int *order, int max_order)
 {
-	struct graph_adj adj;
-	int *visited = NULL;
-	int *stack = NULL;
-	int count = 0;
-	int start = -1;
-	if (G == NULL || G->V == NULL || G->E == NULL) {
-		return -1;
-	}
-	if (order == NULL || max_order <= 0) {
-		return -1;
-	}
-
-	if (build_adjacency(G, 0, &adj) != 0) {
-		return -1;
-	}
-	start = map_label_to_index(adj.map, adj.n, start_label);
-	if (start < 0) {
-		free_graph_adj(&adj);
-		return -1;
-	}
-
-	visited = (int *)calloc((size_t)adj.n, sizeof(int));
-	stack = (int *)calloc((size_t)adj.n, sizeof(int));
-	if (visited == NULL || stack == NULL) {
-		free(visited);
-		free(stack);
-		free_graph_adj(&adj);
-		return -1;
-	}
-
-	/* Mark on push so each node is pushed at most once — stack bounded by n */
-	int top = 0;
-	visited[start] = 1;
-	stack[top++] = start;
-	while (top > 0) {
-		int v = stack[--top];
-		if (count < max_order) {
-			order[count++] = adj.labels[v];
-		}
-
-		int s = adj.out_start[v];
-		int e = adj.out_start[v + 1];
-		int i;
-		for (i = e - 1; i >= s; i--) {
-			int w = adj.out[i];
-			if (!visited[w]) {
-				visited[w] = 1;
-				stack[top++] = w;
-			}
-		}
-	}
-
-	free(visited);
-	free(stack);
-	free_graph_adj(&adj);
-	return count;
+	return compute_cfg_order_internal(G, start_label, order, max_order, 0);
 }
 
-int cfgBfsOrder(struct nGraph *G, int start_label, int *order, int max_order)
+int cfgBfsOrder(const struct nGraph *G, int start_label, int *order, int max_order)
+{
+	return compute_cfg_order_internal(G, start_label, order, max_order, 1);
+}
+
+static int push_cfg_successors(const struct graph_adj *adj, int vertex,
+	int breadth_first, int *visited, int *work, int *tail)
+{
+	int begin = adj->out_start[vertex];
+	int end = adj->out_start[vertex + 1];
+	int index = breadth_first ? begin : end - 1;
+	int step = breadth_first ? 1 : -1;
+
+	while ((breadth_first && index < end) ||
+	       (!breadth_first && index >= begin)) {
+		int successor = adj->out[index];
+		if (!visited[successor]) {
+			if (*tail >= adj->n) {
+				return -1;
+			}
+			visited[successor] = 1;
+			work[*tail] = successor;
+			(*tail)++;
+		}
+		index += step;
+	}
+	return 0;
+}
+
+static int compute_cfg_order_internal(const struct nGraph *G, int start_label,
+	int *order, int max_order, int breadth_first)
 {
 	struct graph_adj adj;
 	int *visited = NULL;
-	int *queue = NULL;
+	int *work = NULL;
 	int count = 0;
 	int start = -1;
+	int head = 0;
+	int tail = 0;
+
 	if (G == NULL || G->V == NULL || G->E == NULL) {
 		return -1;
 	}
@@ -399,38 +441,37 @@ int cfgBfsOrder(struct nGraph *G, int start_label, int *order, int max_order)
 	}
 
 	visited = (int *)calloc((size_t)adj.n, sizeof(int));
-	queue = (int *)calloc((size_t)adj.n, sizeof(int));
-	if (visited == NULL || queue == NULL) {
+	work = (int *)calloc((size_t)adj.n, sizeof(int));
+	if (visited == NULL || work == NULL) {
 		free(visited);
-		free(queue);
+		free(work);
 		free_graph_adj(&adj);
 		return -1;
 	}
 
-	int qh = 0;
-	int qt = 0;
 	visited[start] = 1;
-	queue[qt++] = start;
-	while (qh < qt) {
-		int v = queue[qh++];
+	work[tail++] = start;
+	while (head < tail) {
+		int v;
+
+		if (breadth_first) {
+			v = work[head++];
+		} else {
+			v = work[--tail];
+			head = 0;
+		}
 		if (count < max_order) {
 			order[count++] = adj.labels[v];
 		}
-
-		int s = adj.out_start[v];
-		int e = adj.out_start[v + 1];
-		int i;
-		for (i = s; i < e; i++) {
-			int w = adj.out[i];
-			if (!visited[w]) {
-				visited[w] = 1;
-				queue[qt++] = w;
-			}
+		if (push_cfg_successors(&adj, v, breadth_first,
+		    visited, work, &tail) != 0) {
+			count = -1;
+			break;
 		}
 	}
 
 	free(visited);
-	free(queue);
+	free(work);
 	free_graph_adj(&adj);
 	return count;
 }
@@ -443,16 +484,14 @@ static int dom_word_count(int n)
 
 static void dom_set_all(unsigned long *set, int words)
 {
-	int i;
-	for (i = 0; i < words; i++) {
+	for (int i = 0; i < words; i++) {
 		set[i] = ~0UL;
 	}
 }
 
 static void dom_set_zero(unsigned long *set, int words)
 {
-	int i;
-	for (i = 0; i < words; i++) {
+	for (int i = 0; i < words; i++) {
 		set[i] = 0UL;
 	}
 }
@@ -471,16 +510,14 @@ static int dom_test_bit(const unsigned long *set, int idx)
 
 static void dom_set_and(unsigned long *dst, const unsigned long *src, int words)
 {
-	int i;
-	for (i = 0; i < words; i++) {
+	for (int i = 0; i < words; i++) {
 		dst[i] &= src[i];
 	}
 }
 
 static int dom_set_equal(const unsigned long *a, const unsigned long *b, int words)
 {
-	int i;
-	for (i = 0; i < words; i++) {
+	for (int i = 0; i < words; i++) {
 		if (a[i] != b[i]) return 0;
 	}
 	return 1;
@@ -491,19 +528,42 @@ int dominatorWordCount(int n)
 	return dom_word_count(n);
 }
 
-static int compute_dominators_internal(const struct graph_adj *adj, int start, unsigned long *dom, int words, int use_preds)
+static int intersect_predecessor_sets(const struct graph_adj *adj, int vertex,
+	const unsigned long *dom, int words, int use_preds, unsigned long *result)
+{
+	const int *offsets = use_preds ? adj->in_start : adj->out_start;
+	const int *edges = use_preds ? adj->in : adj->out;
+	int begin = offsets[vertex];
+	int end = offsets[vertex + 1];
+
+	dom_set_all(result, words);
+	if (begin == end) {
+		dom_set_zero(result, words);
+		return 0;
+	}
+	for (int i = begin; i < end; i++) {
+		dom_set_and(result, &dom[edges[i] * words], words);
+	}
+	return 1;
+}
+
+static int compute_dominators_internal(const struct graph_adj *adj, int start,
+	unsigned long *dom, int words, int use_preds)
 {
 	int n = adj->n;
 	int changed = 1;
-	int v;
 	unsigned long *newset = NULL;
 
+	if (dom == NULL || n <= 0 || start < 0 || start >= n ||
+	    words < dom_word_count(n)) {
+		return -1;
+	}
 	newset = (unsigned long *)calloc((size_t)words, sizeof(unsigned long));
 	if (newset == NULL) {
 		return -1;
 	}
 
-	for (v = 0; v < n; v++) {
+	for (int v = 0; v < n; v++) {
 		dom_set_all(&dom[v * words], words);
 	}
 	dom_set_zero(&dom[start * words], words);
@@ -511,36 +571,13 @@ static int compute_dominators_internal(const struct graph_adj *adj, int start, u
 
 	while (changed) {
 		changed = 0;
-		for (v = 0; v < n; v++) {
+		for (int v = 0; v < n; v++) {
 			unsigned long *cur = &dom[v * words];
-			int has_pred = 0;
-			int i;
 			if (v == start) {
 				continue;
 			}
 
-			dom_set_all(newset, words);
-			if (use_preds) {
-				int s = adj->in_start[v];
-				int e = adj->in_start[v + 1];
-				for (i = s; i < e; i++) {
-					int p = adj->in[i];
-					dom_set_and(newset, &dom[p * words], words);
-					has_pred = 1;
-				}
-			} else {
-				int s = adj->out_start[v];
-				int e = adj->out_start[v + 1];
-				for (i = s; i < e; i++) {
-					int p = adj->out[i];
-					dom_set_and(newset, &dom[p * words], words);
-					has_pred = 1;
-				}
-			}
-
-			if (!has_pred) {
-				dom_set_zero(newset, words);
-			}
+			intersect_predecessor_sets(adj, v, dom, words, use_preds, newset);
 			dom_set_bit(newset, v);
 
 			if (!dom_set_equal(cur, newset, words)) {
@@ -555,10 +592,21 @@ static int compute_dominators_internal(const struct graph_adj *adj, int start, u
 	return 0;
 }
 
-int computeDominators(struct nGraph *G, int start_label, unsigned long *dom, int word_count)
+int computeDominators(const struct nGraph *G, int start_label, unsigned long *dom, int word_count)
+{
+	return compute_dominator_sets_internal(G, start_label, dom, word_count, 1);
+}
+
+int computePostDominators(const struct nGraph *G, int exit_label, unsigned long *pdom, int word_count)
+{
+	return compute_dominator_sets_internal(G, exit_label, pdom, word_count, 0);
+}
+
+static int compute_dominator_sets_internal(const struct nGraph *G, int root_label,
+	unsigned long *dom, int word_count, int use_preds)
 {
 	struct graph_adj adj;
-	int start = -1;
+	int root = -1;
 	int rc = 0;
 
 	if (G == NULL || G->V == NULL || G->E == NULL || dom == NULL) {
@@ -567,8 +615,8 @@ int computeDominators(struct nGraph *G, int start_label, unsigned long *dom, int
 	if (build_adjacency(G, 0, &adj) != 0) {
 		return -1;
 	}
-	start = map_label_to_index(adj.map, adj.n, start_label);
-	if (start < 0) {
+	root = map_label_to_index(adj.map, adj.n, root_label);
+	if (root < 0) {
 		free_graph_adj(&adj);
 		return -1;
 	}
@@ -577,34 +625,7 @@ int computeDominators(struct nGraph *G, int start_label, unsigned long *dom, int
 		return -1;
 	}
 
-	rc = compute_dominators_internal(&adj, start, dom, word_count, 1);
-	free_graph_adj(&adj);
-	return rc;
-}
-
-int computePostDominators(struct nGraph *G, int exit_label, unsigned long *pdom, int word_count)
-{
-	struct graph_adj adj;
-	int exit_index = -1;
-	int rc = 0;
-
-	if (G == NULL || G->V == NULL || G->E == NULL || pdom == NULL) {
-		return -1;
-	}
-	if (build_adjacency(G, 0, &adj) != 0) {
-		return -1;
-	}
-	exit_index = map_label_to_index(adj.map, adj.n, exit_label);
-	if (exit_index < 0) {
-		free_graph_adj(&adj);
-		return -1;
-	}
-	if (word_count < dom_word_count(adj.n)) {
-		free_graph_adj(&adj);
-		return -1;
-	}
-
-	rc = compute_dominators_internal(&adj, exit_index, pdom, word_count, 0);
+	rc = compute_dominators_internal(&adj, root, dom, word_count, use_preds);
 	free_graph_adj(&adj);
 	return rc;
 }
@@ -618,8 +639,7 @@ static int dominates(const unsigned long *dom, int words, int a, int b)
 static int dom_popcount(const unsigned long *set, int words)
 {
 	int count = 0;
-	int i;
-	for (i = 0; i < words; i++) {
+	for (int i = 0; i < words; i++) {
 		unsigned long v = set[i];
 		while (v) {
 			count += (int)(v & 1UL);
@@ -629,14 +649,26 @@ static int dom_popcount(const unsigned long *set, int words)
 	return count;
 }
 
-int computeImmediateDominators(struct nGraph *G, int start_label, int *idom)
+int computeImmediateDominators(const struct nGraph *G, int start_label, int *idom,
+	int idom_len)
+{
+	return compute_immediate_dominators_internal(G, start_label, idom, idom_len, 1);
+}
+
+int computeImmediatePostDominators(const struct nGraph *G, int exit_label, int *ipdom,
+	int ipdom_len)
+{
+	return compute_immediate_dominators_internal(G, exit_label, ipdom, ipdom_len, 0);
+}
+
+static int compute_immediate_dominators_internal(const struct nGraph *G, int root_label,
+	int *idom, int idom_len, int use_preds)
 {
 	struct graph_adj adj;
-	int words = 0;
 	unsigned long *dom = NULL;
-	int start = -1;
+	int words = 0;
+	int root = -1;
 	int n = 0;
-	int v, d;
 
 	if (G == NULL || G->V == NULL || G->E == NULL || idom == NULL) {
 		return -1;
@@ -644,13 +676,17 @@ int computeImmediateDominators(struct nGraph *G, int start_label, int *idom)
 	if (build_adjacency(G, 0, &adj) != 0) {
 		return -1;
 	}
-	start = map_label_to_index(adj.map, adj.n, start_label);
-	if (start < 0) {
+	root = map_label_to_index(adj.map, adj.n, root_label);
+	if (root < 0) {
 		free_graph_adj(&adj);
 		return -1;
 	}
 
 	n = adj.n;
+	if (idom_len < n) {
+		free_graph_adj(&adj);
+		return -1;
+	}
 	words = dom_word_count(n);
 	dom = (unsigned long *)calloc((size_t)n * (size_t)words, sizeof(unsigned long));
 	if (dom == NULL) {
@@ -658,7 +694,7 @@ int computeImmediateDominators(struct nGraph *G, int start_label, int *idom)
 		return -1;
 	}
 
-	if (compute_dominators_internal(&adj, start, dom, words, 1) != 0) {
+	if (compute_dominators_internal(&adj, root, dom, words, use_preds) != 0) {
 		free(dom);
 		free_graph_adj(&adj);
 		return -1;
@@ -668,15 +704,18 @@ int computeImmediateDominators(struct nGraph *G, int start_label, int *idom)
 	 * idom(v) is the unique dominator d of v where |dom(d)| = |dom(v)| - 1.
 	 * Using popcount on the bitset reduces the triple-loop O(n^3) to O(n^2*words).
 	 */
-	for (v = 0; v < n; v++) {
+	for (int v = 0; v < n; v++) {
 		int v_count;
 		idom[v] = -1;
-		if (v == start) {
-			idom[v] = adj.labels[start];
+		if (v == root) {
+			idom[v] = adj.labels[root];
 			continue;
 		}
 		v_count = dom_popcount(&dom[v * words], words);
-		for (d = 0; d < n; d++) {
+		if (v_count <= 1) {
+			continue;
+		}
+		for (int d = 0; d < n; d++) {
 			if (d == v) continue;
 			if (!dominates(dom, words, d, v)) continue;
 			if (dom_popcount(&dom[d * words], words) == v_count - 1) {
@@ -687,65 +726,6 @@ int computeImmediateDominators(struct nGraph *G, int start_label, int *idom)
 	}
 
 	free(dom);
-	free_graph_adj(&adj);
-	return 0;
-}
-
-int computeImmediatePostDominators(struct nGraph *G, int exit_label, int *ipdom)
-{
-	struct graph_adj adj;
-	int words = 0;
-	unsigned long *pdom = NULL;
-	int exit_index = -1;
-	int n = 0;
-	int v, d;
-
-	if (G == NULL || G->V == NULL || G->E == NULL || ipdom == NULL) {
-		return -1;
-	}
-	if (build_adjacency(G, 0, &adj) != 0) {
-		return -1;
-	}
-	exit_index = map_label_to_index(adj.map, adj.n, exit_label);
-	if (exit_index < 0) {
-		free_graph_adj(&adj);
-		return -1;
-	}
-
-	n = adj.n;
-	words = dom_word_count(n);
-	pdom = (unsigned long *)calloc((size_t)n * (size_t)words, sizeof(unsigned long));
-	if (pdom == NULL) {
-		free_graph_adj(&adj);
-		return -1;
-	}
-
-	if (compute_dominators_internal(&adj, exit_index, pdom, words, 0) != 0) {
-		free(pdom);
-		free_graph_adj(&adj);
-		return -1;
-	}
-
-	/* Same popcount-based O(n^2*words) approach as computeImmediateDominators */
-	for (v = 0; v < n; v++) {
-		int v_count;
-		ipdom[v] = -1;
-		if (v == exit_index) {
-			ipdom[v] = adj.labels[exit_index];
-			continue;
-		}
-		v_count = dom_popcount(&pdom[v * words], words);
-		for (d = 0; d < n; d++) {
-			if (d == v) continue;
-			if (!dominates(pdom, words, d, v)) continue;
-			if (dom_popcount(&pdom[d * words], words) == v_count - 1) {
-				ipdom[v] = adj.labels[d];
-				break;
-			}
-		}
-	}
-
-	free(pdom);
 	free_graph_adj(&adj);
 	return 0;
 }
@@ -761,60 +741,115 @@ struct scc_frame {
 	int ei;
 };
 
-static void scc_iterative(const struct graph_adj *adj, int root,
-	int *index_arr, int *low, int *stk, int *onstack,
-	int *sp, int *time_val, int *scc_id, int *scc_count,
-	struct scc_frame *frames)
+struct scc_state {
+	int *index;
+	int *low;
+	int *stack;
+	int *onstack;
+	int *scc_id;
+	struct scc_frame *frames;
+	int stack_size;
+	int next_index;
+	int scc_count;
+	int capacity;
+};
+
+static int scc_push_vertex(const struct graph_adj *adj, struct scc_state *state,
+	int vertex, int *frame_count)
 {
-	int fsp = 0;
+	if (vertex < 0 || vertex >= state->capacity ||
+	    state->stack_size >= state->capacity ||
+	    *frame_count >= state->capacity) {
+		return -1;
+	}
+	state->index[vertex] = state->next_index;
+	state->low[vertex] = state->next_index;
+	state->next_index++;
+	state->stack[state->stack_size++] = vertex;
+	state->onstack[vertex] = 1;
+	state->frames[*frame_count].v = vertex;
+	state->frames[*frame_count].ei = adj->out_start[vertex];
+	(*frame_count)++;
+	return 0;
+}
 
-	index_arr[root] = low[root] = (*time_val)++;
-	stk[(*sp)++] = root;
-	onstack[root] = 1;
-	frames[fsp].v = root;
-	frames[fsp].ei = adj->out_start[root];
-	fsp++;
+static int scc_finish_component(struct scc_state *state, int root)
+{
+	int vertex;
 
-	while (fsp > 0) {
-		struct scc_frame *f = &frames[fsp - 1];
+	do {
+		if (state->stack_size <= 0) {
+			return -1;
+		}
+		state->stack_size--;
+		vertex = state->stack[state->stack_size];
+		state->onstack[vertex] = 0;
+		state->scc_id[vertex] = state->scc_count;
+	} while (vertex != root);
+	state->scc_count++;
+	return 0;
+}
+
+static int scc_process_successor(const struct graph_adj *adj,
+	struct scc_state *state, int vertex, int successor, int *frame_count)
+{
+	if (successor < 0 || successor >= state->capacity) {
+		return -1;
+	}
+	if (state->index[successor] < 0) {
+		return scc_push_vertex(adj, state, successor, frame_count);
+	}
+	if (state->onstack[successor] &&
+	    state->index[successor] < state->low[vertex]) {
+		state->low[vertex] = state->index[successor];
+	}
+	return 0;
+}
+
+static int scc_finish_frame(struct scc_state *state, int vertex,
+	int frame_count)
+{
+	if (frame_count > 0) {
+		int parent = state->frames[frame_count - 1].v;
+		if (state->low[vertex] < state->low[parent]) {
+			state->low[parent] = state->low[vertex];
+		}
+	}
+	if (state->low[vertex] == state->index[vertex]) {
+		return scc_finish_component(state, vertex);
+	}
+	return 0;
+}
+
+static int scc_iterative(const struct graph_adj *adj, int root,
+	struct scc_state *state)
+{
+	int frame_count = 0;
+
+	if (scc_push_vertex(adj, state, root, &frame_count) != 0) {
+		return -1;
+	}
+
+	while (frame_count > 0) {
+		struct scc_frame *f = &state->frames[frame_count - 1];
 		int v = f->v;
 
 		if (f->ei < adj->out_start[v + 1]) {
 			int w = adj->out[f->ei++];
-			if (index_arr[w] < 0) {
-				/* push new frame — equivalent to recursive call */
-				index_arr[w] = low[w] = (*time_val)++;
-				stk[(*sp)++] = w;
-				onstack[w] = 1;
-				frames[fsp].v = w;
-				frames[fsp].ei = adj->out_start[w];
-				fsp++;
-			} else if (onstack[w] && index_arr[w] < low[v]) {
-				low[v] = index_arr[w];
+			if (scc_process_successor(adj, state, v, w, &frame_count) != 0) {
+				return -1;
 			}
 		} else {
-			/* all edges processed — equivalent to returning from recursion */
-			fsp--;
-			if (fsp > 0) {
-				int parent = frames[fsp - 1].v;
-				if (low[v] < low[parent]) {
-					low[parent] = low[v];
-				}
-			}
-			if (low[v] == index_arr[v]) {
-				int w;
-				do {
-					w = stk[--(*sp)];
-					onstack[w] = 0;
-					scc_id[w] = *scc_count;
-				} while (w != v);
-				(*scc_count)++;
+			frame_count--;
+			if (scc_finish_frame(state, v, frame_count) != 0) {
+				return -1;
 			}
 		}
 	}
+	return 0;
 }
 
-int computeSCCs(struct nGraph *G, int *scc_id)
+int computeSCCs(const struct nGraph *G, int *scc_id, int scc_id_len)
 {
 	struct graph_adj adj;
 	int *index_arr = NULL;
@@ -822,15 +857,16 @@ int computeSCCs(struct nGraph *G, int *scc_id)
 	int *stack = NULL;
 	int *onstack = NULL;
 	struct scc_frame *frames = NULL;
-	int sp = 0;
-	int time_val = 0;
-	int scc_count = 0;
-	int v;
+	struct scc_state state;
 
 	if (G == NULL || G->V == NULL || G->E == NULL || scc_id == NULL) {
 		return -1;
 	}
 	if (build_adjacency(G, 0, &adj) != 0) {
+		return -1;
+	}
+	if (scc_id_len < adj.n) {
+		free_graph_adj(&adj);
 		return -1;
 	}
 
@@ -849,16 +885,28 @@ int computeSCCs(struct nGraph *G, int *scc_id)
 		return -1;
 	}
 
-	for (v = 0; v < adj.n; v++) {
+	for (int v = 0; v < adj.n; v++) {
 		index_arr[v] = -1;
 		low[v]       = -1;
 		scc_id[v]    = -1;
 	}
 
-	for (v = 0; v < adj.n; v++) {
-		if (index_arr[v] < 0) {
-			scc_iterative(&adj, v, index_arr, low, stack, onstack,
-				&sp, &time_val, scc_id, &scc_count, frames);
+	state.index = index_arr;
+	state.low = low;
+	state.stack = stack;
+	state.onstack = onstack;
+	state.scc_id = scc_id;
+	state.frames = frames;
+	state.stack_size = 0;
+	state.next_index = 0;
+	state.scc_count = 0;
+	state.capacity = adj.n;
+
+	for (int v = 0; v < adj.n; v++) {
+		if (index_arr[v] < 0 &&
+		    scc_iterative(&adj, v, &state) != 0) {
+			state.scc_count = -1;
+			break;
 		}
 	}
 
@@ -868,17 +916,96 @@ int computeSCCs(struct nGraph *G, int *scc_id)
 	free(onstack);
 	free(frames);
 	free_graph_adj(&adj);
-	return scc_count;
+	return state.scc_count;
 }
 
-int computeLoopNestingDepth(struct nGraph *G, int start_label, int *depth_out)
+static int add_loop_predecessor(const struct graph_adj *adj,
+	const unsigned long *dom, int words, int header, int predecessor,
+	int *loop_stack, int *in_loop, int *top)
+{
+	if (in_loop[predecessor] ||
+	    !dominates(dom, words, header, predecessor)) {
+		return 0;
+	}
+	if (*top >= adj->n) {
+		return -1;
+	}
+	in_loop[predecessor] = 1;
+	loop_stack[*top] = predecessor;
+	(*top)++;
+	return 0;
+}
+
+static int mark_natural_loop(const struct graph_adj *adj,
+	const unsigned long *dom, int words, int tail, int header,
+	int *loop_stack, int *in_loop)
+{
+	int top = 0;
+
+	memset(in_loop, 0, (size_t)adj->n * sizeof(int));
+	in_loop[header] = 1;
+	in_loop[tail] = 1;
+	loop_stack[top++] = tail;
+	while (top > 0) {
+		int vertex = loop_stack[--top];
+		for (int i = adj->in_start[vertex]; i < adj->in_start[vertex + 1]; i++) {
+			int predecessor = adj->in[i];
+			if (add_loop_predecessor(adj, dom, words, header,
+			    predecessor, loop_stack, in_loop, &top) != 0) {
+				return -1;
+			}
+		}
+	}
+	return 0;
+}
+
+static void add_loop_depths(const int *in_loop, int n, int *depth_out,
+	int *max_depth)
+{
+	for (int i = 0; i < n; i++) {
+		if (!in_loop[i]) {
+			continue;
+		}
+		depth_out[i]++;
+		if (depth_out[i] > *max_depth) {
+			*max_depth = depth_out[i];
+		}
+	}
+}
+
+static int process_back_edges(const struct graph_adj *adj,
+	const unsigned long *dom, int words, int *depth_out, int *max_depth,
+	int *loop_stack, int *in_loop)
+{
+	if (adj->out == NULL) {
+		return 0;
+	}
+	for (int tail = 0; tail < adj->n; tail++) {
+		for (int i = adj->out_start[tail]; i < adj->out_start[tail + 1]; i++) {
+			int header = adj->out[i];
+			if (!dominates(dom, words, header, tail)) {
+				continue;
+			}
+			if (mark_natural_loop(adj, dom, words, tail, header,
+			    loop_stack, in_loop) != 0) {
+				return -1;
+			}
+			add_loop_depths(in_loop, adj->n, depth_out, max_depth);
+		}
+	}
+	return 0;
+}
+
+int computeLoopNestingDepth(const struct nGraph *G, int start_label, int *depth_out,
+	int depth_len)
 {
 	struct graph_adj adj;
 	int words = 0;
 	unsigned long *dom = NULL;
+	int *loop_stack = NULL;
+	int *in_loop = NULL;
 	int start = -1;
 	int n = 0;
-	int u;
 	int max_depth = 0;
 
 	if (G == NULL || G->V == NULL || G->E == NULL || depth_out == NULL) {
@@ -894,6 +1021,10 @@ int computeLoopNestingDepth(struct nGraph *G, int start_label, int *depth_out)
 	}
 
 	n = adj.n;
+	if (depth_len < n) {
+		free_graph_adj(&adj);
+		return -1;
+	}
 	words = dom_word_count(n);
 	dom = (unsigned long *)calloc((size_t)n * (size_t)words, sizeof(unsigned long));
 	if (dom == NULL) {
@@ -906,73 +1037,52 @@ int computeLoopNestingDepth(struct nGraph *G, int start_label, int *depth_out)
 		return -1;
 	}
 
-	for (u = 0; u < n; u++) {
+	for (int u = 0; u < n; u++) {
 		depth_out[u] = 0;
 	}
 
-	/* Allocate once outside the loop — reused for every back edge via memset */
-	{
-		int *loop_stack = (int *)calloc((size_t)n, sizeof(int));
-		int *in_loop    = (int *)calloc((size_t)n, sizeof(int));
-		if (loop_stack == NULL || in_loop == NULL) {
-			free(loop_stack);
-			free(in_loop);
-			free(dom);
-			free_graph_adj(&adj);
-			return -1;
-		}
-
-		for (u = 0; u < n; u++) {
-			int i;
-			for (i = adj.out_start[u]; i < adj.out_start[u + 1]; i++) {
-				int v = adj.out[i];
-				if (dominates(dom, words, v, u)) {
-					int top = 0;
-					int x;
-					/* Reset for this back-edge's loop body — O(n) but no alloc */
-					memset(in_loop, 0, (size_t)n * sizeof(int));
-					in_loop[v] = 1;
-					in_loop[u] = 1;
-					loop_stack[top++] = u;
-					while (top > 0) {
-						x = loop_stack[--top];
-						int p;
-						for (p = adj.in_start[x]; p < adj.in_start[x + 1]; p++) {
-							int pred = adj.in[p];
-							if (!in_loop[pred] && dominates(dom, words, v, pred)) {
-								in_loop[pred] = 1;
-								loop_stack[top++] = pred;
-							}
-						}
-					}
-
-					for (x = 0; x < n; x++) {
-						if (in_loop[x]) {
-							depth_out[x]++;
-							if (depth_out[x] > max_depth) {
-								max_depth = depth_out[x];
-							}
-						}
-					}
-				}
-			}
-		}
-
+	loop_stack = (int *)calloc((size_t)n, sizeof(int));
+	in_loop = (int *)calloc((size_t)n, sizeof(int));
+	if (loop_stack == NULL || in_loop == NULL) {
 		free(loop_stack);
 		free(in_loop);
+		free(dom);
+		free_graph_adj(&adj);
+		return -1;
+	}
+	if (process_back_edges(&adj, dom, words, depth_out, &max_depth,
+	    loop_stack, in_loop) != 0) {
+		max_depth = -1;
 	}
 
+	free(loop_stack);
+	free(in_loop);
 	free(dom);
 	free_graph_adj(&adj);
 	return max_depth;
 }
 
-int sliceForward(struct nGraph *dep, int start_label, int *mark, int mark_len)
+int sliceForward(const struct nGraph *dep, int start_label, int *mark, int mark_len)
+{
+	return compute_slice_internal(dep, start_label, mark, mark_len, 0);
+}
+
+int sliceBackward(const struct nGraph *dep, int start_label, int *mark, int mark_len)
+{
+	return compute_slice_internal(dep, start_label, mark, mark_len, 1);
+}
+
+static int compute_slice_internal(const struct nGraph *dep, int start_label, int *mark,
+	int mark_len, int use_predecessors)
 {
 	struct graph_adj adj;
 	int *stack = NULL;
 	int count = 0;
 	int start = -1;
+	const int *start_offsets = NULL;
+	const int *edges = NULL;
+	int top = 0;
+
 	if (dep == NULL || dep->V == NULL || dep->E == NULL) {
 		return -1;
 	}
@@ -999,17 +1109,18 @@ int sliceForward(struct nGraph *dep, int start_label, int *mark, int mark_len)
 		return -1;
 	}
 
+	start_offsets = use_predecessors ? adj.in_start : adj.out_start;
+	edges = use_predecessors ? adj.in : adj.out;
+
 	/* Mark on push — each node pushed at most once, stack bounded by n */
 	memset(mark, 0, (size_t)adj.n * sizeof(int));
-	int top = 0;
 	mark[start] = 1;
 	count = 1;
 	stack[top++] = start;
 	while (top > 0) {
 		int v = stack[--top];
-		int i;
-		for (i = adj.out_start[v]; i < adj.out_start[v + 1]; i++) {
-			int w = adj.out[i];
+		for (int i = start_offsets[v]; i < start_offsets[v + 1]; i++) {
+			int w = edges[i];
 			if (!mark[w]) {
 				mark[w] = 1;
 				count++;
@@ -1023,80 +1134,44 @@ int sliceForward(struct nGraph *dep, int start_label, int *mark, int mark_len)
 	return count;
 }
 
-int sliceBackward(struct nGraph *dep, int start_label, int *mark, int mark_len)
+struct text_buffer {
+	char *data;
+	size_t capacity;
+	size_t length;
+};
+
+static int buffer_append_text(struct text_buffer *buffer, const char *text)
 {
-	struct graph_adj adj;
-	int *stack = NULL;
-	int count = 0;
-	int start = -1;
-	if (dep == NULL || dep->V == NULL || dep->E == NULL) {
+	size_t text_length = strlen(text);
+
+	if (text_length >= buffer->capacity - buffer->length) {
 		return -1;
 	}
-	if (mark == NULL || mark_len <= 0) {
-		return -1;
-	}
-
-	if (build_adjacency(dep, 0, &adj) != 0) {
-		return -1;
-	}
-	if (mark_len < adj.n) {
-		free_graph_adj(&adj);
-		return -1;
-	}
-	start = map_label_to_index(adj.map, adj.n, start_label);
-	if (start < 0) {
-		free_graph_adj(&adj);
-		return -1;
-	}
-
-	stack = (int *)calloc((size_t)adj.n, sizeof(int));
-	if (stack == NULL) {
-		free_graph_adj(&adj);
-		return -1;
-	}
-
-	/* Mark on push — each node pushed at most once, stack bounded by n */
-	memset(mark, 0, (size_t)adj.n * sizeof(int));
-	int top = 0;
-	mark[start] = 1;
-	count = 1;
-	stack[top++] = start;
-	while (top > 0) {
-		int v = stack[--top];
-		int i;
-		for (i = adj.in_start[v]; i < adj.in_start[v + 1]; i++) {
-			int w = adj.in[i];
-			if (!mark[w]) {
-				mark[w] = 1;
-				count++;
-				stack[top++] = w;
-			}
-		}
-	}
-
-	free(stack);
-	free_graph_adj(&adj);
-	return count;
-}
-
-static int appendf(char *buf, size_t cap, size_t *len, const char *fmt, ...)
-{
-	va_list ap;
-	int n;
-
-	if (*len >= cap) {
-		return -1;
-	}
-
-	va_start(ap, fmt);
-	n = vsnprintf(buf + *len, cap - *len, fmt, ap);
-	va_end(ap);
-
-	if (n < 0 || (size_t)n >= cap - *len) {
-		return -1;
-	}
-	*len += (size_t)n;
+	memcpy(buffer->data + buffer->length, text, text_length + 1U);
+	buffer->length += text_length;
 	return 0;
+}
+
+static int buffer_append_int(struct text_buffer *buffer, int value)
+{
+	char text[32];
+	int length = snprintf(text, sizeof(text), "%d", value);
+
+	if (length < 0 || (size_t)length >= sizeof(text)) {
+		return -1;
+	}
+	return buffer_append_text(buffer, text);
+}
+
+static int buffer_append_double(struct text_buffer *buffer, double value)
+{
+	char text[64];
+	int length = snprintf(text, sizeof(text), "%.4f", value);
+
+	if (length < 0 || (size_t)length >= sizeof(text)) {
+		return -1;
+	}
+	return buffer_append_text(buffer, text);
 }
 
 static void format_cell(char *dst, size_t size, int value)
@@ -1156,139 +1231,216 @@ static void free_analysis_data(struct analysis_data *data)
  * Must be called AFTER data->labels and data->idom are populated.
  * All per-node arrays are in vertex-list order (matching data->labels[]).
  */
+static void compute_degree_metrics(const struct graph_adj *adj,
+	struct analysis_data *data)
+{
+	int n = data->n;
+
+	for (int i = 0; i < n; i++) {
+		int ai = map_label_to_index(adj->map, n, data->labels[i]);
+		if (ai < 0) continue;
+		data->fan_out[i] = adj->out_start[ai + 1] - adj->out_start[ai];
+		data->fan_in[i] = adj->in_start[ai + 1] - adj->in_start[ai];
+		if (data->fan_out[i] >= 2) data->predicate_count++;
+		if (data->fan_in[i] >= 2) data->join_count++;
+	}
+}
+
+static void map_reachability(const struct graph_adj *adj, const int *distance,
+	struct analysis_data *data)
+{
+	for (int i = 0; i < data->n; i++) {
+		int ai = map_label_to_index(adj->map, data->n, data->labels[i]);
+		int node_distance = ai >= 0 ? distance[ai] : -1;
+
+		if (node_distance < 0) {
+			data->dead_count++;
+			continue;
+		}
+		data->reachable[i] = 1;
+		if (node_distance > data->longest_path) {
+			data->longest_path = node_distance;
+		}
+	}
+}
+
+static int enqueue_successors(const struct graph_adj *adj, int vertex,
+	int *distance, int *queue, int *tail)
+{
+	for (int i = adj->out_start[vertex]; i < adj->out_start[vertex + 1]; i++) {
+		int successor = adj->out[i];
+		if (successor < 0 || successor >= adj->n) {
+			return -1;
+		}
+		if (distance[successor] >= 0) {
+			continue;
+		}
+		if (*tail >= adj->n) {
+			return -1;
+		}
+		distance[successor] = distance[vertex] + 1;
+		queue[*tail] = successor;
+		(*tail)++;
+	}
+	return 0;
+}
+
+static int dequeue_vertex(const struct graph_adj *adj, const int *queue,
+	int *head, int tail)
+{
+	if (*head < 0 || *head >= tail || *head >= adj->n) {
+		return -1;
+	}
+	return queue[(*head)++];
+}
+
+static void compute_reachability_metrics(const struct graph_adj *adj, int start,
+	struct analysis_data *data)
+{
+	int *distance = NULL;
+	int *queue = NULL;
+	int head = 0;
+	int tail = 0;
+
+	if (start < 0) {
+		data->dead_count = data->n;
+		return;
+	}
+	if (data->n != adj->n) {
+		return;
+	}
+	distance = (int *)malloc((size_t)adj->n * sizeof(int));
+	queue = (int *)malloc((size_t)adj->n * sizeof(int));
+	if (distance == NULL || queue == NULL) {
+		free(distance);
+		free(queue);
+		return;
+	}
+	for (int i = 0; i < adj->n; i++) {
+		distance[i] = -1;
+	}
+	distance[start] = 0;
+	queue[tail++] = start;
+	if (adj->out != NULL) {
+		while (head < tail) {
+			int vertex = dequeue_vertex(adj, queue, &head, tail);
+			if (vertex < 0) {
+				break;
+			}
+			if (enqueue_successors(adj, vertex, distance, queue, &tail) != 0) {
+				break;
+			}
+		}
+	}
+	map_reachability(adj, distance, data);
+	free(distance);
+	free(queue);
+}
+
+static int count_vertex_back_edges(const struct graph_adj *adj,
+	const unsigned long *dom, int words, int tail)
+{
+	int count = 0;
+
+	for (int i = adj->out_start[tail]; i < adj->out_start[tail + 1]; i++) {
+		int header = adj->out[i];
+		if (header >= 0 && header < adj->n &&
+		    dom_test_bit(&dom[tail * words], header)) {
+			count++;
+		}
+	}
+	return count;
+}
+
+static void compute_back_edge_metric(const struct graph_adj *adj, int start,
+	struct analysis_data *data)
+{
+	int words = dom_word_count(data->n);
+	unsigned long *dom = NULL;
+
+	if (start < 0 || adj->out == NULL) {
+		return;
+	}
+	dom = (unsigned long *)calloc((size_t)data->n * (size_t)words,
+		sizeof(unsigned long));
+	if (dom == NULL) {
+		return;
+	}
+	if (compute_dominators_internal(adj, start, dom, words, 1) == 0) {
+		for (int tail = 0; tail < data->n; tail++) {
+			data->back_edges += count_vertex_back_edges(adj, dom, words, tail);
+		}
+	}
+	free(dom);
+}
+
+static int find_label_index(const int *labels, int n, int label)
+{
+	for (int i = 0; i < n; i++) {
+		if (labels[i] == label) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+static int update_dominator_depth(struct analysis_data *data, int root)
+{
+	int changed = 0;
+
+	for (int i = 0; i < data->n; i++) {
+		int parent;
+		if (i == root || data->dom_depth[i] >= 0 || data->idom[i] < 0) {
+			continue;
+		}
+		parent = find_label_index(data->labels, data->n, data->idom[i]);
+		if (parent >= 0 && data->dom_depth[parent] >= 0) {
+			data->dom_depth[i] = data->dom_depth[parent] + 1;
+			changed = 1;
+		}
+	}
+	return changed;
+}
+
+static void compute_dominator_depths(int start_label, struct analysis_data *data)
+{
+	int root = find_label_index(data->labels, data->n, start_label);
+
+	if (root < 0) {
+		return;
+	}
+	data->dom_depth[root] = 0;
+	while (update_dominator_depth(data, root)) {
+		/* Continue until every reachable parent depth has propagated. */
+	}
+}
+
 static void analysis_extra_metrics(const struct nGraph *G, int start_label,
 	struct analysis_data *data)
 {
 	struct graph_adj adj;
-	unsigned long *dom = NULL;
-	int *bfs_dist = NULL;
-	int *queue = NULL;
-	int n = data->n;
-	int words;
 	int start;
-	int i;
 
-	if (n <= 0) return;   /* guard for GCC's calloc range analysis across inlining */
-
-	if (build_adjacency(G, 0, &adj) != 0) {
+	if (data->n <= 0 || build_adjacency(G, 0, &adj) != 0) {
 		return;
 	}
-
-	start = map_label_to_index(adj.map, n, start_label);
-
-	/* ── Fan-in / Fan-out ─────────────────────────────────────────────────
-	 * adj is in label-sorted order; data->labels[] is in vertex-list order.
-	 * Convert each vertex-list index i → adj index via map_label_to_index.  */
-	for (i = 0; i < n; i++) {
-		int ai = map_label_to_index(adj.map, n, data->labels[i]);
-		if (ai < 0) continue;
-		data->fan_out[i] = adj.out_start[ai + 1] - adj.out_start[ai];
-		data->fan_in[i]  = adj.in_start[ai + 1]  - adj.in_start[ai];
-		if (data->fan_out[i] >= 2) data->predicate_count++;
-		if (data->fan_in[i]  >= 2) data->join_count++;
+	start = map_label_to_index(adj.map, adj.n, start_label);
+	compute_degree_metrics(&adj, data);
+	if (data->n > 1) {
+		data->density = (double)G->E->count /
+			((double)data->n * (double)(data->n - 1));
 	}
-
-	/* ── Graph density E / (N*(N-1)) ──────────────────────────────────── */
-	if (n > 1) {
-		data->density = (double)G->E->count / ((double)n * (double)(n - 1));
-	}
-
-	/* ── BFS from entry: reachability + longest path ──────────────────── */
-	bfs_dist = (int *)calloc((size_t)n, sizeof(int));
-	queue    = (int *)calloc((size_t)n, sizeof(int));
-	if (bfs_dist != NULL && queue != NULL && start >= 0) {
-		int qh = 0, qt = 0;
-		for (i = 0; i < n; i++) bfs_dist[i] = -1;
-		bfs_dist[start] = 0;
-		queue[qt++] = start;
-		while (qh < qt) {
-			int v = queue[qh++];
-			int j;
-			for (j = adj.out_start[v]; j < adj.out_start[v + 1]; j++) {
-				int w = adj.out[j];
-				if (bfs_dist[w] < 0) {
-					bfs_dist[w] = bfs_dist[v] + 1;
-					queue[qt++] = w;
-				}
-			}
-		}
-		/* Map bfs_dist (adj order) → reachable (vertex-list order) */
-		for (i = 0; i < n; i++) {
-			int ai = map_label_to_index(adj.map, n, data->labels[i]);
-			int d  = (ai >= 0) ? bfs_dist[ai] : -1;
-			if (d >= 0) {
-				data->reachable[i] = 1;
-				if (d > data->longest_path) data->longest_path = d;
-			} else {
-				data->reachable[i] = 0;
-				data->dead_count++;
-			}
-		}
-	}
-	free(bfs_dist);
-	free(queue);
-
-	/* ── Back edges: (u→v) is a back edge iff v dominates u ──────────── */
-	words = dom_word_count(n);
-	dom   = (unsigned long *)calloc((size_t)n * (size_t)words, sizeof(unsigned long));
-	if (dom != NULL && start >= 0) {
-		if (compute_dominators_internal(&adj, start, dom, words, 1) == 0) {
-			for (i = 0; i < n; i++) {
-				int j;
-				for (j = adj.out_start[i]; j < adj.out_start[i + 1]; j++) {
-					int v = adj.out[j];
-					/* v dominates i → edge (i→v) is a back edge */
-					if (dom_test_bit(&dom[i * words], v)) {
-						data->back_edges++;
-					}
-				}
-			}
-		}
-	}
-	free(dom);
-
-	/* ── Dominator-tree depth from data->idom[] ───────────────────────
-	 * data->idom[i] = label of idom of vertex-list node i.
-	 * Fixed-point: dom_depth[root] = 0, then propagate through idom links.
-	 * Terminates in at most n passes (tree depth bounded by n-1).         */
-	{
-		int start_vl = -1; /* start node in vertex-list order */
-		int changed;
-		for (i = 0; i < n; i++) {
-			if (data->labels[i] == start_label) { start_vl = i; break; }
-		}
-		if (start_vl >= 0) {
-			data->dom_depth[start_vl] = 0;
-			changed = 1;
-			while (changed) {
-				changed = 0;
-				for (i = 0; i < n; i++) {
-					int j;
-					if (i == start_vl) continue;
-					if (data->dom_depth[i] >= 0) continue;
-					if (data->idom[i] < 0) continue;
-					/* find parent in vertex-list order */
-					for (j = 0; j < n; j++) {
-						if (data->labels[j] == data->idom[i]
-								&& data->dom_depth[j] >= 0) {
-							data->dom_depth[i] = data->dom_depth[j] + 1;
-							changed = 1;
-							break;
-						}
-					}
-				}
-			}
-		}
-	}
-
+	compute_reachability_metrics(&adj, start, data);
+	compute_back_edge_metric(&adj, start, data);
+	compute_dominator_depths(start_label, data);
 	free_graph_adj(&adj);
 }
 
-static int build_analysis_data(struct nGraph *G, int start_label, int exit_label,
+static int build_analysis_data(const struct nGraph *G, int start_label,
+	int exit_label,
 	struct analysis_data *data)
 {
 	int n = G->V->count;
-	int i;
 
 	memset(data, 0, sizeof(*data));
 	if (n <= 0) {
@@ -1311,7 +1463,7 @@ static int build_analysis_data(struct nGraph *G, int start_label, int exit_label
 		return -1;
 	}
 
-	for (i = 0; i < n; i++) {
+	for (int i = 0; i < n; i++) {
 		data->idom[i]      = -1;
 		data->ipdom[i]     = -1;
 		data->scc_id[i]    = -1;
@@ -1326,14 +1478,14 @@ static int build_analysis_data(struct nGraph *G, int start_label, int exit_label
 
 	data->n         = n;
 	data->complexity = cyclomaticComplexity(G);
-	data->scc_count  = computeSCCs(G, data->scc_id);
-	data->max_depth  = computeLoopNestingDepth(G, start_label, data->depth);
+	data->scc_count  = computeSCCs(G, data->scc_id, n);
+	data->max_depth  = computeLoopNestingDepth(G, start_label, data->depth, n);
 
-	if (computeImmediateDominators(G, start_label, data->idom) != 0) {
-		for (i = 0; i < n; i++) data->idom[i] = -1;
+	if (computeImmediateDominators(G, start_label, data->idom, n) != 0) {
+		for (int i = 0; i < n; i++) data->idom[i] = -1;
 	}
-	if (computeImmediatePostDominators(G, exit_label, data->ipdom) != 0) {
-		for (i = 0; i < n; i++) data->ipdom[i] = -1;
+	if (computeImmediatePostDominators(G, exit_label, data->ipdom, n) != 0) {
+		for (int i = 0; i < n; i++) data->ipdom[i] = -1;
 	}
 
 	/* Compute the remaining RE metrics (fan-in/out, density, reachability,
@@ -1347,56 +1499,44 @@ static int build_analysis_data(struct nGraph *G, int start_label, int exit_label
 int printAnalysisTable(struct nGraph *G, int start_label, int exit_label)
 {
 	struct analysis_data data;
-	int i;
-	/* Summary: ~30 chars/metric * ~12 metrics; per-node: ~80 chars * n */
-	size_t cap = 1024 + (size_t)G->V->count * 192;
-	size_t len = 0;
-	char *buf;
 
 	if (G == NULL || G->V == NULL || G->E == NULL) {
 		return -1;
 	}
-	buf = (char *)calloc(cap, 1);
-	if (buf == NULL) {
-		return -1;
-	}
 	if (build_analysis_data(G, start_label, exit_label, &data) != 0) {
-		free(buf);
 		return -1;
 	}
 
-	/* ── Graph-level summary ─────────────────────────────────────────── */
-	appendf(buf, cap, &len, "+---------------------------+---------------+\n");
-	appendf(buf, cap, &len, "| Metric                    | Value         |\n");
-	appendf(buf, cap, &len, "+---------------------------+---------------+\n");
-	appendf(buf, cap, &len, "| Nodes (N)                 | %13d |\n", data.n);
-	appendf(buf, cap, &len, "| Edges (E)                 | %13d |\n", G->E->count);
-	appendf(buf, cap, &len, "| Cyclomatic Complexity (M) | %13d |\n", data.complexity);
-	appendf(buf, cap, &len, "| Strongly Conn. Components | %13d |\n", data.scc_count);
-	appendf(buf, cap, &len, "| Max Loop Nesting Depth    | %13d |\n", data.max_depth);
-	appendf(buf, cap, &len, "| Graph Density E/(N(N-1))  | %13.4f |\n", data.density);
-	appendf(buf, cap, &len, "| Back Edges (Natural Loops)| %13d |\n", data.back_edges);
-	appendf(buf, cap, &len, "| Predicate Nodes (fout>=2) | %13d |\n", data.predicate_count);
-	appendf(buf, cap, &len, "| Join Nodes (fin>=2)       | %13d |\n", data.join_count);
-	appendf(buf, cap, &len, "| Dead/Unreachable Nodes    | %13d |\n", data.dead_count);
-	appendf(buf, cap, &len, "| Longest Path from Entry   | %13d |\n", data.longest_path);
-	appendf(buf, cap, &len, "+---------------------------+---------------+\n\n");
-
-	/* ── Per-node table ──────────────────────────────────────────────── */
-	appendf(buf, cap, &len,
-		"+------+-----+------+----------+----------+-----+------+-----+-------+\n");
-	appendf(buf, cap, &len,
-		"| Node | Fin | Fout |  IDom    |  IPDom   | LpD | DomD | SCC | Reach |\n");
-	appendf(buf, cap, &len,
-		"+------+-----+------+----------+----------+-----+------+-----+-------+\n");
-	for (i = 0; i < data.n; i++) {
-		char idom_c[12], ipdom_c[12], lpd_c[8], domd_c[8], scc_c[8];
+	printf("+---------------------------+---------------+\n");
+	printf("| Metric                    | Value         |\n");
+	printf("+---------------------------+---------------+\n");
+	printf("| Nodes (N)                 | %13d |\n", data.n);
+	printf("| Edges (E)                 | %13d |\n", G->E->count);
+	printf("| Cyclomatic Complexity (M) | %13d |\n", data.complexity);
+	printf("| Strongly Conn. Components | %13d |\n", data.scc_count);
+	printf("| Max Loop Nesting Depth    | %13d |\n", data.max_depth);
+	printf("| Graph Density E/(N(N-1))  | %13.4f |\n", data.density);
+	printf("| Back Edges (Natural Loops)| %13d |\n", data.back_edges);
+	printf("| Predicate Nodes (fout>=2) | %13d |\n", data.predicate_count);
+	printf("| Join Nodes (fin>=2)       | %13d |\n", data.join_count);
+	printf("| Dead/Unreachable Nodes    | %13d |\n", data.dead_count);
+	printf("| Longest Path from Entry   | %13d |\n", data.longest_path);
+	printf("+---------------------------+---------------+\n\n");
+	printf("+------+-----+------+----------+----------+-----+------+-----+-------+\n");
+	printf("| Node | Fin | Fout |  IDom    |  IPDom   | LpD | DomD | SCC | Reach |\n");
+	printf("+------+-----+------+----------+----------+-----+------+-----+-------+\n");
+	for (int i = 0; i < data.n; i++) {
+		char idom_c[12];
+		char ipdom_c[12];
+		char lpd_c[8];
+		char domd_c[8];
+		char scc_c[8];
 		format_cell(idom_c,  sizeof(idom_c),  data.idom[i]);
 		format_cell(ipdom_c, sizeof(ipdom_c), data.ipdom[i]);
 		format_cell(lpd_c,   sizeof(lpd_c),   data.depth[i]);
 		format_cell(domd_c,  sizeof(domd_c),  data.dom_depth[i]);
 		format_cell(scc_c,   sizeof(scc_c),   data.scc_id[i]);
-		appendf(buf, cap, &len,
+		printf(
 			"| %-4d | %-3d | %-4d | %-8s | %-8s | %-3s | %-4s | %-3s | %-5d |\n",
 			data.labels[i],
 			data.fan_in[i], data.fan_out[i],
@@ -1404,11 +1544,7 @@ int printAnalysisTable(struct nGraph *G, int start_label, int exit_label)
 			lpd_c, domd_c, scc_c,
 			data.reachable[i]);
 	}
-	appendf(buf, cap, &len,
-		"+------+-----+------+----------+----------+-----+------+-----+-------+\n");
-
-	printf("%s", buf);
-	free(buf);
+	printf("+------+-----+------+----------+----------+-----+------+-----+-------+\n");
 	free_analysis_data(&data);
 	return 0;
 }
@@ -1416,10 +1552,9 @@ int printAnalysisTable(struct nGraph *G, int start_label, int exit_label)
 char *analysisTableDotHtml(struct nGraph *G, int start_label, int exit_label)
 {
 	struct analysis_data data;
-	int i;
 	size_t cap;
-	size_t len = 0;
 	char *buf;
+	struct text_buffer output;
 
 	if (G == NULL || G->V == NULL || G->E == NULL) {
 		return NULL;
@@ -1434,62 +1569,68 @@ char *analysisTableDotHtml(struct nGraph *G, int start_label, int exit_label)
 		free(buf);
 		return NULL;
 	}
+	output.data = buf;
+	output.capacity = cap;
+	output.length = 0;
 
-	/* ── Outer table ──────────────────────────────────────────────────── */
-	appendf(buf, cap, &len,
+	buffer_append_text(&output,
 		"<TABLE BORDER=\"0\" CELLBORDER=\"1\" CELLSPACING=\"0\" CELLPADDING=\"3\" BGCOLOR=\"#FAFAFA\">");
-
-	/* ── Title ─────────────────────────────────────────────────────────── */
-	appendf(buf, cap, &len,
+	buffer_append_text(&output,
 		"<TR><TD COLSPAN=\"6\" BGCOLOR=\"#2C3E50\" ALIGN=\"CENTER\">"
 		"<FONT COLOR=\"white\"><B>CFG / RE Analysis</B></FONT></TD></TR>");
-
-	/* ── Graph-level summary (two columns per row) ─────────────────────── */
-	appendf(buf, cap, &len,
+	buffer_append_text(&output,
 		"<TR>"
 		"<TD BGCOLOR=\"#3498DB\"><FONT COLOR=\"white\"><B>Nodes (N)</B></FONT></TD>"
-		"<TD ALIGN=\"RIGHT\"><B>%d</B></TD>"
+		"<TD ALIGN=\"RIGHT\"><B>");
+	buffer_append_int(&output, data.n);
+	buffer_append_text(&output, "</B></TD>"
 		"<TD BGCOLOR=\"#3498DB\"><FONT COLOR=\"white\"><B>Edges (E)</B></FONT></TD>"
-		"<TD ALIGN=\"RIGHT\"><B>%d</B></TD>"
+		"<TD ALIGN=\"RIGHT\"><B>");
+	buffer_append_int(&output, G->E->count);
+	buffer_append_text(&output, "</B></TD>"
 		"<TD BGCOLOR=\"#3498DB\"><FONT COLOR=\"white\"><B>Cyclomatic (M=E-N+2P)</B></FONT></TD>"
-		"<TD ALIGN=\"RIGHT\"><B>%d</B></TD>"
-		"</TR>",
-		data.n, G->E->count, data.complexity);
-
-	appendf(buf, cap, &len,
+		"<TD ALIGN=\"RIGHT\"><B>");
+	buffer_append_int(&output, data.complexity);
+	buffer_append_text(&output, "</B></TD></TR>");
+	buffer_append_text(&output,
 		"<TR>"
 		"<TD BGCOLOR=\"#3498DB\"><FONT COLOR=\"white\"><B>SCCs</B></FONT></TD>"
-		"<TD ALIGN=\"RIGHT\">%d</TD>"
+		"<TD ALIGN=\"RIGHT\">");
+	buffer_append_int(&output, data.scc_count);
+	buffer_append_text(&output, "</TD>"
 		"<TD BGCOLOR=\"#3498DB\"><FONT COLOR=\"white\"><B>Max Loop Depth</B></FONT></TD>"
-		"<TD ALIGN=\"RIGHT\">%d</TD>"
+		"<TD ALIGN=\"RIGHT\">");
+	buffer_append_int(&output, data.max_depth);
+	buffer_append_text(&output, "</TD>"
 		"<TD BGCOLOR=\"#3498DB\"><FONT COLOR=\"white\"><B>Graph Density</B></FONT></TD>"
-		"<TD ALIGN=\"RIGHT\">%.4f</TD>"
-		"</TR>",
-		data.scc_count, data.max_depth, data.density);
-
-	appendf(buf, cap, &len,
+		"<TD ALIGN=\"RIGHT\">");
+	buffer_append_double(&output, data.density);
+	buffer_append_text(&output, "</TD></TR>");
+	buffer_append_text(&output,
 		"<TR>"
 		"<TD BGCOLOR=\"#27AE60\"><FONT COLOR=\"white\"><B>Back Edges</B></FONT></TD>"
-		"<TD ALIGN=\"RIGHT\">%d</TD>"
+		"<TD ALIGN=\"RIGHT\">");
+	buffer_append_int(&output, data.back_edges);
+	buffer_append_text(&output, "</TD>"
 		"<TD BGCOLOR=\"#27AE60\"><FONT COLOR=\"white\"><B>Predicate Nodes</B></FONT></TD>"
-		"<TD ALIGN=\"RIGHT\">%d</TD>"
+		"<TD ALIGN=\"RIGHT\">");
+	buffer_append_int(&output, data.predicate_count);
+	buffer_append_text(&output, "</TD>"
 		"<TD BGCOLOR=\"#27AE60\"><FONT COLOR=\"white\"><B>Join Nodes</B></FONT></TD>"
-		"<TD ALIGN=\"RIGHT\">%d</TD>"
-		"</TR>",
-		data.back_edges, data.predicate_count, data.join_count);
-
-	appendf(buf, cap, &len,
+		"<TD ALIGN=\"RIGHT\">");
+	buffer_append_int(&output, data.join_count);
+	buffer_append_text(&output, "</TD></TR>");
+	buffer_append_text(&output,
 		"<TR>"
 		"<TD BGCOLOR=\"#E74C3C\"><FONT COLOR=\"white\"><B>Dead Nodes</B></FONT></TD>"
-		"<TD ALIGN=\"RIGHT\">%d</TD>"
+		"<TD ALIGN=\"RIGHT\">");
+	buffer_append_int(&output, data.dead_count);
+	buffer_append_text(&output, "</TD>"
 		"<TD BGCOLOR=\"#E74C3C\"><FONT COLOR=\"white\"><B>Longest Path</B></FONT></TD>"
-		"<TD ALIGN=\"RIGHT\">%d</TD>"
-		"<TD COLSPAN=\"2\"></TD>"
-		"</TR>",
-		data.dead_count, data.longest_path);
-
-	/* ── Per-node header ───────────────────────────────────────────────── */
-	appendf(buf, cap, &len,
+		"<TD ALIGN=\"RIGHT\">");
+	buffer_append_int(&output, data.longest_path);
+	buffer_append_text(&output, "</TD><TD COLSPAN=\"2\"></TD></TR>");
+	buffer_append_text(&output,
 		"<TR BGCOLOR=\"#2C3E50\">"
 		"<TD><FONT COLOR=\"white\"><B>Node</B></FONT></TD>"
 		"<TD><FONT COLOR=\"white\"><B>Fin|Fout</B></FONT></TD>"
@@ -1499,33 +1640,42 @@ char *analysisTableDotHtml(struct nGraph *G, int start_label, int exit_label)
 		"<TD><FONT COLOR=\"white\"><B>SCC|Reach</B></FONT></TD>"
 		"</TR>");
 
-	/* ── Per-node rows ─────────────────────────────────────────────────── */
-	for (i = 0; i < data.n; i++) {
-		char idom_c[12], ipdom_c[12], lpd_c[8], domd_c[8], scc_c[8];
+	for (int i = 0; i < data.n; i++) {
+		char idom_c[12];
+		char ipdom_c[12];
+		char lpd_c[8];
+		char domd_c[8];
+		char scc_c[8];
 		const char *bg = (data.reachable[i] == 0) ? " BGCOLOR=\"#FADBD8\"" : "";
 		format_cell(idom_c,  sizeof(idom_c),  data.idom[i]);
 		format_cell(ipdom_c, sizeof(ipdom_c), data.ipdom[i]);
 		format_cell(lpd_c,   sizeof(lpd_c),   data.depth[i]);
 		format_cell(domd_c,  sizeof(domd_c),  data.dom_depth[i]);
 		format_cell(scc_c,   sizeof(scc_c),   data.scc_id[i]);
-		appendf(buf, cap, &len,
-			"<TR%s>"
-			"<TD ALIGN=\"CENTER\"><B>%d</B></TD>"
-			"<TD ALIGN=\"CENTER\">%d|%d</TD>"
-			"<TD ALIGN=\"CENTER\">%s</TD>"
-			"<TD ALIGN=\"CENTER\">%s</TD>"
-			"<TD ALIGN=\"CENTER\">%s|%s</TD>"
-			"<TD ALIGN=\"CENTER\">%s|%d</TD>"
-			"</TR>",
-			bg,
-			data.labels[i],
-			data.fan_in[i], data.fan_out[i],
-			idom_c, ipdom_c,
-			lpd_c, domd_c,
-			scc_c, data.reachable[i]);
+		buffer_append_text(&output, "<TR");
+		buffer_append_text(&output, bg);
+		buffer_append_text(&output, "><TD ALIGN=\"CENTER\"><B>");
+		buffer_append_int(&output, data.labels[i]);
+		buffer_append_text(&output, "</B></TD><TD ALIGN=\"CENTER\">");
+		buffer_append_int(&output, data.fan_in[i]);
+		buffer_append_text(&output, "|");
+		buffer_append_int(&output, data.fan_out[i]);
+		buffer_append_text(&output, "</TD><TD ALIGN=\"CENTER\">");
+		buffer_append_text(&output, idom_c);
+		buffer_append_text(&output, "</TD><TD ALIGN=\"CENTER\">");
+		buffer_append_text(&output, ipdom_c);
+		buffer_append_text(&output, "</TD><TD ALIGN=\"CENTER\">");
+		buffer_append_text(&output, lpd_c);
+		buffer_append_text(&output, "|");
+		buffer_append_text(&output, domd_c);
+		buffer_append_text(&output, "</TD><TD ALIGN=\"CENTER\">");
+		buffer_append_text(&output, scc_c);
+		buffer_append_text(&output, "|");
+		buffer_append_int(&output, data.reachable[i]);
+		buffer_append_text(&output, "</TD></TR>");
 	}
 
-	appendf(buf, cap, &len, "</TABLE>");
+	buffer_append_text(&output, "</TABLE>");
 
 	free_analysis_data(&data);
 	return buf;
