@@ -134,8 +134,8 @@ void showDimac(struct nGraph *);
 void exportDimac(struct nGraph *);
 void makeDimac(struct nGraph *, char *);
 void exportGLPK(struct nGraph *);
-void showAnalysisPdf(struct nGraph *, int, int);
-void exportAnalysisDot(struct nGraph *, int, int);
+void showAnalysisPdf(const struct nGraph *, int, int);
+void exportAnalysisDot(const struct nGraph *, int, int);
 void exportTikZ(struct nGraph *);
 void exportGraphML(struct nGraph *);
 void listVerticesAlphabet(struct nGraph *);
@@ -222,8 +222,8 @@ int computeSCCs(const struct nGraph *, int *, int);
 int computeLoopNestingDepth(const struct nGraph *, int, int *, int);
 int sliceForward(const struct nGraph *, int, int *, int);
 int sliceBackward(const struct nGraph *, int, int *, int);
-int printAnalysisTable(struct nGraph *, int, int);
-char *analysisTableDotHtml(struct nGraph *, int, int);
+int printAnalysisTable(const struct nGraph *, int, int);
+char *analysisTableDotHtml(const struct nGraph *, int, int);
 
 // Extra
 struct CallGraphBuilder {

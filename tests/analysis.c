@@ -152,6 +152,10 @@ int main(void)
 
 	struct nGraph Z = newGraph("NoEdges");
 	addVertex(&Z, 7);
+	int single_depth[1];
+	ok &= check(computeLoopNestingDepth(&Z, 7, single_depth, 1) == 0,
+		"single-node loop depth");
+	ok &= check(single_depth[0] == 0, "single-node loop depth value");
 	char *empty_analysis = analysisTableDotHtml(&Z, 7, 7);
 	ok &= check(empty_analysis != NULL, "empty-edge analysis");
 	free(empty_analysis);

@@ -655,14 +655,14 @@ void setDisplayType(struct nGraph *G, char *type) {
   }
 }
 
-void exportAnalysisDot(struct nGraph *G, int start_label, int exit_label) {
+void exportAnalysisDot(const struct nGraph *G, int start_label, int exit_label) {
   char *table = analysisTableDotHtml(G, start_label, exit_label);
 
   write_analysis_table_dot(stdout, G, table, 0);
   free(table);
 }
 
-void showAnalysisPdf(struct nGraph *G, int start_label, int exit_label) {
+void showAnalysisPdf(const struct nGraph *G, int start_label, int exit_label) {
   char *filename = NULL;
   char *fileimage = NULL;
   char *table = analysisTableDotHtml(G, start_label, exit_label);

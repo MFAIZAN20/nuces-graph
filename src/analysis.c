@@ -20,6 +20,17 @@ struct graph_adj {
 	struct label_index *map;
 };
 
+struct loop_mark_state {
+	const struct graph_adj *adj;
+	const unsigned long *dom;
+	int capacity;
+	int words;
+	int header;
+	int *loop_stack;
+	int *in_loop;
+	int top;
+};
+
 static int compute_cfg_order_internal(const struct nGraph *G, int start_label,
 	int *order, int max_order, int breadth_first);
 static int compute_dominator_sets_internal(const struct nGraph *G, int root_label,
@@ -291,6 +302,24 @@ int graphEdgeCount(const struct nGraph *G)
 	return G->E->count;
 }
 
+static int enqueue_component_successor(const struct graph_adj *adj,
+	int successor, int *visited, int *queue, int *tail)
+{
+	if (successor < 0 || successor >= adj->n) {
+		return -1;
+	}
+	if (visited[successor]) {
+		return 0;
+	}
+	if (*tail >= adj->n) {
+		return -1;
+	}
+	visited[successor] = 1;
+	queue[*tail] = successor;
+	(*tail)++;
+	return 0;
+}
+
 static int visit_weak_component(const struct graph_adj *adj, int root,
 	int *visited, int *queue)
 {
@@ -310,15 +339,9 @@ static int visit_weak_component(const struct graph_adj *adj, int root,
 		for (int i = adj->out_start[vertex];
 		     i < adj->out_start[vertex + 1]; i++) {
 			int successor = adj->out[i];
-			if (successor < 0 || successor >= adj->n) {
+			if (enqueue_component_successor(adj, successor, visited,
+			    queue, &tail) != 0) {
 				return -1;
-			}
-			if (!visited[successor]) {
-				if (tail >= adj->n) {
-					return -1;
-				}
-				visited[successor] = 1;
-				queue[tail++] = successor;
 			}
 		}
 	}
@@ -919,20 +942,21 @@ int computeSCCs(const struct nGraph *G, int *scc_id, int scc_id_len)
 	return state.scc_count;
 }
 
-static int add_loop_predecessor(const struct graph_adj *adj,
-	const unsigned long *dom, int words, int header, int predecessor,
-	int *loop_stack, int *in_loop, int *top)
+static int add_loop_predecessor(struct loop_mark_state *state, int predecessor)
 {
-	if (in_loop[predecessor] ||
-	    !dominates(dom, words, header, predecessor)) {
-		return 0;
-	}
-	if (*top >= adj->n) {
+	if (predecessor < 0 || predecessor >= state->capacity) {
 		return -1;
 	}
-	in_loop[predecessor] = 1;
-	loop_stack[*top] = predecessor;
-	(*top)++;
+	if (state->in_loop[predecessor] ||
+	    !dominates(state->dom, state->words, state->header, predecessor)) {
+		return 0;
+	}
+	if (state->top < 0 || state->top >= state->capacity) {
+		return -1;
+	}
+	state->in_loop[predecessor] = 1;
+	state->loop_stack[state->top] = predecessor;
+	state->top++;
 	return 0;
 }
 
@@ -940,18 +964,32 @@ static int mark_natural_loop(const struct graph_adj *adj,
 	const unsigned long *dom, int words, int tail, int header,
 	int *loop_stack, int *in_loop)
 {
-	int top = 0;
+	struct loop_mark_state state;
+
+	if (tail < 0 || tail >= adj->n || header < 0 || header >= adj->n) {
+		return -1;
+	}
 
 	memset(in_loop, 0, (size_t)adj->n * sizeof(int));
+	state.adj = adj;
+	state.dom = dom;
+	state.capacity = adj->n;
+	state.words = words;
+	state.header = header;
+	state.loop_stack = loop_stack;
+	state.in_loop = in_loop;
+	state.top = 0;
 	in_loop[header] = 1;
 	in_loop[tail] = 1;
-	loop_stack[top++] = tail;
-	while (top > 0) {
-		int vertex = loop_stack[--top];
+	if (state.top >= state.capacity) {
+		return -1;
+	}
+	loop_stack[state.top++] = tail;
+	while (state.top > 0) {
+		int vertex = loop_stack[--state.top];
 		for (int i = adj->in_start[vertex]; i < adj->in_start[vertex + 1]; i++) {
 			int predecessor = adj->in[i];
-			if (add_loop_predecessor(adj, dom, words, header,
-			    predecessor, loop_stack, in_loop, &top) != 0) {
+			if (add_loop_predecessor(&state, predecessor) != 0) {
 				return -1;
 			}
 		}
@@ -959,23 +997,34 @@ static int mark_natural_loop(const struct graph_adj *adj,
 	return 0;
 }
 
-static void add_loop_depths(const int *in_loop, int n, int *depth_out,
-	int *max_depth)
+struct back_edge_state {
+	int *depth_out;
+	int depth_len;
+	int *max_depth;
+	int *loop_stack;
+	int *in_loop;
+};
+
+static void add_loop_depths(int n, const int *in_loop, struct back_edge_state *state)
 {
-	for (int i = 0; i < n; i++) {
+	int limit;
+	if (n <= 0 || in_loop == NULL || state == NULL || state->depth_out == NULL || state->max_depth == NULL || state->depth_len <= 0) {
+		return;
+	}
+	limit = n < state->depth_len ? n : state->depth_len;
+	for (int i = 0; i < limit; i++) {
 		if (!in_loop[i]) {
 			continue;
 		}
-		depth_out[i]++;
-		if (depth_out[i] > *max_depth) {
-			*max_depth = depth_out[i];
+		state->depth_out[i]++;
+		if (state->depth_out[i] > *state->max_depth) {
+			*state->max_depth = state->depth_out[i];
 		}
 	}
 }
 
 static int process_back_edges(const struct graph_adj *adj,
-	const unsigned long *dom, int words, int *depth_out, int *max_depth,
-	int *loop_stack, int *in_loop)
+	const unsigned long *dom, int words, struct back_edge_state *state)
 {
 	if (adj->out == NULL) {
 		return 0;
@@ -987,10 +1036,10 @@ static int process_back_edges(const struct graph_adj *adj,
 				continue;
 			}
 			if (mark_natural_loop(adj, dom, words, tail, header,
-			    loop_stack, in_loop) != 0) {
+			    state->loop_stack, state->in_loop) != 0) {
 				return -1;
 			}
-			add_loop_depths(in_loop, adj->n, depth_out, max_depth);
+			add_loop_depths(adj->n, state->in_loop, state);
 		}
 	}
 	return 0;
@@ -1007,6 +1056,7 @@ int computeLoopNestingDepth(const struct nGraph *G, int start_label, int *depth_
 	int start = -1;
 	int n = 0;
 	int max_depth = 0;
+	struct back_edge_state state;
 
 	if (G == NULL || G->V == NULL || G->E == NULL || depth_out == NULL) {
 		return -1;
@@ -1050,8 +1100,13 @@ int computeLoopNestingDepth(const struct nGraph *G, int start_label, int *depth_
 		free_graph_adj(&adj);
 		return -1;
 	}
-	if (process_back_edges(&adj, dom, words, depth_out, &max_depth,
-	    loop_stack, in_loop) != 0) {
+	state.depth_out = depth_out;
+	state.depth_len = depth_len;
+	state.max_depth = &max_depth;
+	state.loop_stack = loop_stack;
+	state.in_loop = in_loop;
+
+	if (process_back_edges(&adj, dom, words, &state) != 0) {
 		max_depth = -1;
 	}
 
@@ -1222,6 +1277,14 @@ static void free_analysis_data(struct analysis_data *data)
 	memset(data, 0, sizeof(*data));
 }
 
+static void fill_minus_one_ints(int n, int *values)
+{
+	if (n <= 0 || values == NULL) {
+		return;
+	}
+	memset(values, 0xFF, (size_t)n * sizeof(*values));
+}
+
 /*
  * Computes all metrics that require a single shared adjacency build:
  *   fan-in, fan-out, predicate/join counts, density,
@@ -1294,13 +1357,31 @@ static int dequeue_vertex(const struct graph_adj *adj, const int *queue,
 	return queue[(*head)++];
 }
 
+static int traverse_reachability(const struct graph_adj *adj, int start,
+	int *distance, int *queue)
+{
+	int head = 0;
+	int tail = 0;
+
+	distance[start] = 0;
+	queue[tail++] = start;
+	while (head < tail) {
+		int vertex = dequeue_vertex(adj, queue, &head, tail);
+		if (vertex < 0) {
+			return -1;
+		}
+		if (enqueue_successors(adj, vertex, distance, queue, &tail) != 0) {
+			return -1;
+		}
+	}
+	return 0;
+}
+
 static void compute_reachability_metrics(const struct graph_adj *adj, int start,
 	struct analysis_data *data)
 {
 	int *distance = NULL;
 	int *queue = NULL;
-	int head = 0;
-	int tail = 0;
 
 	if (start < 0) {
 		data->dead_count = data->n;
@@ -1319,18 +1400,12 @@ static void compute_reachability_metrics(const struct graph_adj *adj, int start,
 	for (int i = 0; i < adj->n; i++) {
 		distance[i] = -1;
 	}
-	distance[start] = 0;
-	queue[tail++] = start;
-	if (adj->out != NULL) {
-		while (head < tail) {
-			int vertex = dequeue_vertex(adj, queue, &head, tail);
-			if (vertex < 0) {
-				break;
-			}
-			if (enqueue_successors(adj, vertex, distance, queue, &tail) != 0) {
-				break;
-			}
-		}
+	if (adj->out != NULL &&
+	    traverse_reachability(adj, start, distance, queue) != 0) {
+		map_reachability(adj, distance, data);
+		free(distance);
+		free(queue);
+		return;
 	}
 	map_reachability(adj, distance, data);
 	free(distance);
@@ -1446,6 +1521,7 @@ static int build_analysis_data(const struct nGraph *G, int start_label,
 	if (n <= 0) {
 		return -1;
 	}
+	data->n = n;
 
 	data->labels    = (int *)calloc((size_t)n, sizeof(int));
 	data->idom      = (int *)calloc((size_t)n, sizeof(int));
@@ -1463,20 +1539,17 @@ static int build_analysis_data(const struct nGraph *G, int start_label,
 		return -1;
 	}
 
-	for (int i = 0; i < n; i++) {
-		data->idom[i]      = -1;
-		data->ipdom[i]     = -1;
-		data->scc_id[i]    = -1;
-		data->depth[i]     = -1;
-		data->dom_depth[i] = -1;  /* -1 = unreachable in dom tree */
-	}
+	fill_minus_one_ints(n, data->idom);
+	fill_minus_one_ints(n, data->ipdom);
+	fill_minus_one_ints(n, data->scc_id);
+	fill_minus_one_ints(n, data->depth);
+	fill_minus_one_ints(n, data->dom_depth);  /* -1 = unreachable in dom tree */
 
 	if (getVertexLabels(G, data->labels, n) != n) {
 		free_analysis_data(data);
 		return -1;
 	}
 
-	data->n         = n;
 	data->complexity = cyclomaticComplexity(G);
 	data->scc_count  = computeSCCs(G, data->scc_id, n);
 	data->max_depth  = computeLoopNestingDepth(G, start_label, data->depth, n);
@@ -1496,7 +1569,7 @@ static int build_analysis_data(const struct nGraph *G, int start_label,
 	return 0;
 }
 
-int printAnalysisTable(struct nGraph *G, int start_label, int exit_label)
+int printAnalysisTable(const struct nGraph *G, int start_label, int exit_label)
 {
 	struct analysis_data data;
 
@@ -1549,7 +1622,7 @@ int printAnalysisTable(struct nGraph *G, int start_label, int exit_label)
 	return 0;
 }
 
-char *analysisTableDotHtml(struct nGraph *G, int start_label, int exit_label)
+char *analysisTableDotHtml(const struct nGraph *G, int start_label, int exit_label)
 {
 	struct analysis_data data;
 	size_t cap;
